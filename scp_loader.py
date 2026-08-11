@@ -123,12 +123,18 @@ def main():
             json_files.append((path, file_to_key.get(filename, "misc")))
 
     all_slugs = {}
+    index = {}
     for path, key in json_files:
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
-            for slug in data.keys():
+            for slug, entry in data.items():
                 all_slugs[slug] = key
+                index[slug] = {
+                    "title": entry.get("title", slug),
+                    "folder": key,
+                    "json_file": os.path.basename(path),
+                }
         except:
             pass
 
@@ -150,6 +156,14 @@ def main():
         futures = [executor.submit(image_downloader_worker) for _ in range(10)]
         for future in as_completed(futures):
             pass
+
+    index_path = os.path.join(BASE_FOLDER, "index.json")
+    try:
+        with open(index_path, "w", encoding="utf-8") as f:
+            json.dump(index, f, ensure_ascii=False)
+        print(f"🗂️  Índice generado: {index_path} ({len(index)} entradas)")
+    except Exception as e:
+        print(f"❌ Error guardando índice: {e}")
 
     print("✅ ¡Todos los artículos y recursos fueron procesados!")
 
