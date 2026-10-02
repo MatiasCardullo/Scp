@@ -12,7 +12,7 @@ IMG_FOLDER = os.path.join(BASE_FOLDER, "images")
 BASE_JSON_URL = "https://scp-data.tedivm.com/data/scp/items/"
 CONTENT_INDEX_URL = BASE_JSON_URL + "content_index.json"
 
-MAX_WORKERS = 3  # cantidad de archivos que se procesan/descargan en simultaneo
+MAX_WORKERS = 4  # Number of files processed/downloaded concurrently.
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
 SCP_HREF_RE = re.compile(r'^/scp-(\d+[\w-]*)', re.IGNORECASE)
 SCP_MENTION_RE = re.compile(r'\b(SCP-\d{1,4})\b')
@@ -26,7 +26,7 @@ def ensure_folder(path):
 
 
 def run_parallel(items, worker_fn, desc):
-    """Corre worker_fn sobre items con MAX_WORKERS threads y barra de progreso tqdm."""
+    """Run worker_fn on items using MAX_WORKERS threads and a tqdm progress bar."""
     results = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(worker_fn, item): item for item in items}
@@ -47,16 +47,15 @@ def download_json_file(filename):
             f.write(r.content)
         return filepath
     except Exception as e:
-        tqdm.write(f"Error al descargar {filename}: {e}")
+        tqdm.write(f"Error downloading {filename}: {e}")
         return None
 
 
 def image_filename_from_url(url):
-    """Nombre de archivo local a partir de una URL de imagen. Usar solo el
-    ultimo segmento no alcanza: muchas imagenes del dataset comparten el
-    mismo nombre generico (ej. '.../scp-025/025.jpeg/medium.jpg', donde
-    'medium.jpg' se repite en decenas de articulos distintos). Se arma el
-    nombre con los ultimos segmentos del path para que sea unico."""
+    """Build a local filename from an image URL. The last path segment alone
+    is not enough: many dataset images share a generic name (e.g.
+    '.../scp-025/025.jpeg/medium.jpg', where 'medium.jpg' appears in dozens
+    of different articles). Use the last path segments to make it unique."""
     path = urlparse(url).path
     parts = [p for p in path.split("/") if p]
     tail = parts[-3:] if len(parts) >= 3 else parts
@@ -86,15 +85,14 @@ def download_image(item):
         with open(path, "wb") as f:
             f.write(r.content)
     except Exception as e:
-        tqdm.write(f"Error imagen {url}: {e}")
+        tqdm.write(f"Image error for {url}: {e}")
 
 
 def build_image_url_map(soup):
-    """Mapea nombre-de-archivo -> URL real, revisando TODOS los <a href> del
-    documento que apunten a un archivo de imagen. El <img src> real muchas
-    veces es una ruta relativa generica (ej. '../images/medium.jpg') y la
-    URL real solo aparece en un link a otro lado del articulo (ej. la caja
-    de licencia) o en el <a> que envuelve la imagen."""
+    """Map filename to its real URL by checking every <a href> in the document
+    that points to an image. The actual <img src> is often a generic relative
+    path (e.g. '../images/medium.jpg'), while the real URL only appears in a
+    link elsewhere in the article (e.g. the license box) or wrapping the image."""
     url_map = {}
     for a in soup.find_all("a", href=True):
         href = a["href"]
@@ -109,8 +107,8 @@ def resolve_image_url(img, url_map):
     if not src:
         return None
     if src.startswith("http"):
-        # avatares de wikidot (autor/historial): decorativos, con query string
-        # distinto por usuario -> colisionan todos al mismo nombre de archivo
+        # Wikidot avatars (author/history) are decorative and use user-specific
+        # query strings, which would otherwise all collide on the same filename.
         return None if "avatar.php" in src.lower() else src
     parent_href = img.parent.get("href") if img.parent.name == "a" else None
     if parent_href and parent_href.lower().startswith("http") and parent_href.lower().endswith(IMAGE_EXTS):
@@ -123,9 +121,9 @@ def resolve_image_url(img, url_map):
 
 
 def build_slug_index(json_files):
-    """all_slugs: slug (con el casing real del dataset) -> carpeta/serie.
-    norm_slugs: SLUG-EN-MAYUSCULA -> slug real, para poder matchear
-    menciones sin depender de que el casing coincida exactamente."""
+    """all_slugs maps each slug (with its original dataset casing) to its
+    folder/series. norm_slugs maps uppercase slugs to their original casing so
+    mentions can be matched regardless of their capitalization."""
     all_slugs = {}
     for path, key in json_files:
         try:
@@ -140,20 +138,20 @@ def build_slug_index(json_files):
 
 
 def process_json_file(filepath, subfolder_name, all_slugs, norm_slugs):
-    """Procesa un archivo json de una serie: genera el HTML de cada articulo
-    (con links entre SCPs, imagenes locales, sin auto-referencias) y
-    devuelve el indice parcial {slug: {title, folder, json_file}}."""
+    """Process a series JSON file: generate HTML for each article (with links
+    between SCPs, local images, and no self-references) and return its partial
+    index in the form {slug: {title, folder, json_file}}."""
     partial_index = {}
     try:
         with open(filepath, encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
-        tqdm.write(f"Error leyendo {filepath}: {e}")
+        tqdm.write(f"Error reading {filepath}: {e}")
         return partial_index
 
     def find_slug_location(mention):
-        """mention: texto tal como aparece (ej. 'SCP-999'). Devuelve
-        (slug_real, ruta_relativa) o (None, None) si no lo tenemos local."""
+        """Given a mention as it appears in the text (e.g. 'SCP-999'), return
+        (real_slug, relative_path), or (None, None) if it is not available locally."""
         real_slug = norm_slugs.get(mention.upper())
         if not real_slug:
             return None, None
@@ -166,12 +164,12 @@ def process_json_file(filepath, subfolder_name, all_slugs, norm_slugs):
         soup = BeautifulSoup(html, "html.parser")
         own_slug_upper = slug.upper()
 
-        # quitar la caja de "‡ Licensing / Citation": es boilerplate repetido
-        # en cada articulo y sus links plegables (javascript:;) no hacen nada aca
+        # Remove the "‡ Licensing / Citation" box, which is repeated boilerplate;
+        # its collapsible links (javascript:;) do not work here.
         for box in soup.find_all("div", class_="licensebox"):
             box.decompose()
 
-        # --- imagenes: resolver la URL real (parent <a> o match por nombre) ---
+        # --- Images: resolve the real URL (parent <a> or filename match). ---
         url_map = build_image_url_map(soup)
         for img in soup.find_all("img"):
             real_url = resolve_image_url(img, url_map)
@@ -185,17 +183,17 @@ def process_json_file(filepath, subfolder_name, all_slugs, norm_slugs):
                 continue
             mention = f"SCP-{m.group(1)}"
             if mention.upper() == own_slug_upper:
-                # auto-referencia (ej. caja de citado): texto plano, no clickeable
+                # Self-reference (e.g. citation box): plain, non-clickable text.
                 a.replace_with(a.get_text())
                 continue
             real_slug, rel_path = find_slug_location(mention)
             if real_slug:
                 a["href"] = f"../{rel_path}"
             else:
-                # no lo tenemos descargado localmente: dejar como link externo real
+                # Not available locally: keep it as a real external link.
                 a["href"] = f"https://scpwiki.com{a['href']}"
 
-        # --- menciones sueltas en texto plano (nunca envueltas en <a>) ---
+        # --- Standalone mentions in plain text (never wrapped in an <a>). ---
         def link_scp_refs(text):
             def sub(m):
                 mention = m.group(1)
@@ -212,7 +210,7 @@ def process_json_file(filepath, subfolder_name, all_slugs, norm_slugs):
                 continue
             new_html = link_scp_refs(str(tag))
             if new_html != str(tag):
-                # fragmento PARSEADO, no texto plano (si no, el <a> queda escapado)
+                # Parse as a fragment, not plain text, or the <a> will be escaped.
                 tag.replace_with(BeautifulSoup(new_html, "html.parser"))
 
         folder_path = os.path.join(HTML_FOLDER, subfolder_name)
@@ -222,7 +220,7 @@ def process_json_file(filepath, subfolder_name, all_slugs, norm_slugs):
             with open(html_path, "w", encoding="utf-8") as f:
                 f.write(str(soup))
         except Exception as e:
-            tqdm.write(f"Error guardando HTML {slug}: {e}")
+            tqdm.write(f"Error saving HTML for {slug}: {e}")
             continue
 
         partial_index[slug] = {
@@ -240,17 +238,17 @@ def main():
     ensure_folder(HTML_FOLDER)
     ensure_folder(IMG_FOLDER)
 
-    print("Descargando indice de contenidos...")
+    print("Downloading content index...")
     try:
         content_index = requests.get(CONTENT_INDEX_URL, timeout=30).json()
     except Exception as e:
-        print(f"Error descargando indice: {e}")
+        print(f"Error downloading content index: {e}")
         return
 
     file_to_key = {v: k for k, v in content_index.items()}
 
     downloaded_paths = run_parallel(
-        list(content_index.values()), download_json_file, "Descargando series"
+        list(content_index.values()), download_json_file, "Downloading series"
     )
     json_files = [
         (path, file_to_key.get(os.path.basename(path), "misc"))
@@ -258,15 +256,15 @@ def main():
     ]
 
     all_slugs, norm_slugs = build_slug_index(json_files)
-    print(f"{len(all_slugs)} slugs encontrados. Procesando articulos...")
+    print(f"Found {len(all_slugs)} slugs. Processing articles...")
 
     partial_indexes = run_parallel(
         json_files,
         lambda item: process_json_file(item[0], item[1], all_slugs, norm_slugs),
-        "Procesando articulos",
+        "Processing articles",
     )
 
-    # el indice se genera aca, apenas estan los HTML listos, antes de bajar imagenes
+    # Generate the index as soon as the HTML is ready, before downloading images.
     index = {}
     for partial in partial_indexes:
         index.update(partial)
@@ -275,14 +273,14 @@ def main():
     try:
         with open(index_path, "w", encoding="utf-8") as f:
             json.dump(index, f, ensure_ascii=False)
-        print(f"Indice generado: {index_path} ({len(index)} entradas)")
+        print(f"Index generated: {index_path} ({len(index)} entries)")
     except Exception as e:
-        print(f"Error guardando indice: {e}")
+        print(f"Error saving index: {e}")
 
-    print(f"Descargando imagenes ({len(download_queue)} archivos)...")
-    run_parallel(list(download_queue), download_image, "Descargando imagenes")
+    print(f"Downloading images ({len(download_queue)} files)...")
+    run_parallel(list(download_queue), download_image, "Downloading images")
 
-    print("Todos los articulos y recursos fueron procesados.")
+    print("All articles and resources have been processed.")
 
 
 if __name__ == "__main__":
