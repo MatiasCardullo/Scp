@@ -7,7 +7,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.screen import Screen
-from textual.widgets import Footer, Header, Input, Markdown, RichLog, Static
+from textual.widgets import Footer, Header, Input, Markdown, Static
 
 INDEX_PATH = os.path.join("scp_data", "index.json")
 HTML_EXPORT_FOLDER = os.path.join("scp_data", "html")
@@ -119,63 +119,32 @@ class ArticleScreen(Screen):
         yield Footer()
 
 
-class SCPListScreen(Screen):
-    BINDINGS = [Binding("escape", "app.pop_screen", "Back")]
-
-    CSS = """
-    Screen {
-        background: #050805;
-        color: #33ff33;
-    }
-    #list-scroll {
-        height: 1fr;
-        border: round #1f7a1f;
-        margin: 0 1;
-        padding: 1;
-    }
-    #scp-grid {
-        padding: 0 1;
-    }
-    """
-
-    def __init__(self, articles):
-        super().__init__()
-        self.articles = articles
-        self.link_to_slug = {
-            str(index): slug for index, (slug, _) in enumerate(articles)
-        }
-
-    def compose(self) -> ComposeResult:
-        links = []
-        for index, (slug, title) in enumerate(self.articles):
-            label = f"{slug} - {title}"
-            label = label.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
-            links.append(f"[{label}](scp-article:{index})")
-        rows = [
-            "    ".join(links[index:index + 4])
-            for index in range(0, len(links), 4)
-        ]
-        yield Header(show_clock=False)
-        yield VerticalScroll(
-            Markdown("\n\n".join(rows), id="scp-grid", open_links=False),
-            id="list-scroll",
-        )
-        yield Footer()
-
-    def on_markdown_link_clicked(self, event: Markdown.LinkClicked):
-        if not event.href.startswith("scp-article:"):
-            return
-        slug = self.link_to_slug.get(event.href.removeprefix("scp-article:"))
-        if slug:
-            self.app.show_scp(slug)
-
-
 def scp_sort_key(slug):
     match = re.fullmatch(r"SCP-(\d+)(.*)", slug, re.IGNORECASE)
     if not match:
         return (1, float("inf"), slug.casefold(), slug.casefold())
     number, suffix = match.groups()
     return (bool(suffix), int(number), suffix.casefold(), slug.casefold())
+
+
+def series_title(folder):
+    match = re.fullmatch(r"series-(\d+(?:\.\d+)?)", folder, re.IGNORECASE)
+    if match:
+        return f"SCP Series {match.group(1)}"
+    return {
+        "scp-001": "SCP-001 Proposals",
+        "decommissioned": "Decommissioned SCPs",
+        "explained": "Explained SCPs",
+        "international": "International SCPs",
+        "joke": "Joke SCPs",
+    }.get(folder.casefold(), folder.replace("-", " ").title())
+
+
+def series_sort_key(folder):
+    match = re.fullmatch(r"series-(\d+(?:\.\d+)?)", folder, re.IGNORECASE)
+    if match:
+        return (0, float(match.group(1)), folder.casefold())
+    return (1, float("inf"), series_title(folder).casefold())
 
 
 class SCPReader(App):
@@ -200,6 +169,10 @@ class SCPReader(App):
         padding: 0 1;
         scrollbar-color: #1f7a1f;
     }
+    #output > Static, #output > Markdown {
+        width: 1fr;
+        margin-bottom: 1;
+    }
     CommandInput {
         margin: 0 1 1 1;
         border: round #1f7a1f;
@@ -213,7 +186,7 @@ class SCPReader(App):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
-        yield RichLog(id="output", wrap=True, markup=False, highlight=False)
+        yield VerticalScroll(id="output")
         yield CommandInput(placeholder="Type help to see available commands", id="command")
         yield Footer()
 
@@ -243,12 +216,14 @@ class SCPReader(App):
             return None
 
     def write_output(self, text):
-        self.query_one("#output", RichLog).write(text)
+        output = self.query_one("#output", VerticalScroll)
+        output.mount(Static(text, markup=False))
+        output.scroll_end(animate=False)
 
     def list_scps(self):
         if self.index is not None:
             articles = [
-                (slug, entry.get("title", slug))
+                (slug, entry.get("title") or slug, entry.get("folder", "misc"))
                 for slug, entry in self.index.items()
             ]
         else:
@@ -261,10 +236,11 @@ class SCPReader(App):
                     try:
                         with open(path, encoding="utf-8") as file:
                             data = json.load(file)
+                        series = os.path.splitext(filename)[0].removeprefix("content_")
                         articles.extend(
-                            (slug, entry["title"])
+                            (slug, entry.get("title") or slug, series)
                             for slug, entry in data.items()
-                            if slug.startswith("SCP-") and entry.get("title")
+                            if slug.startswith("SCP-")
                         )
                     except (OSError, json.JSONDecodeError) as error:
                         self.write_output(f"[{filename}] Error: {error}")
@@ -273,7 +249,27 @@ class SCPReader(App):
             self.write_output("No SCP articles were found.")
             return
         articles.sort(key=lambda article: scp_sort_key(article[0]))
-        self.push_screen(SCPListScreen(articles))
+        grouped_articles = {}
+        for slug, title, series in articles:
+            grouped_articles.setdefault(series, []).append((slug, title))
+
+        output = self.query_one("#output", VerticalScroll)
+        for series in sorted(grouped_articles, key=series_sort_key):
+            links = []
+            for slug, title in grouped_articles[series]:
+                label = title.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+                links.append(f"[{label}](scp-article:{slug})")
+            article_lines = [
+                "  ".join(links[start:start + 10])
+                for start in range(0, len(links), 10)
+            ]
+            markdown = f"## {series_title(series)}\n\n" + "  \n".join(article_lines)
+            output.mount(Markdown(markdown, open_links=False))
+        output.scroll_end(animate=False)
+
+    def on_markdown_link_clicked(self, event: Markdown.LinkClicked):
+        if event.href.startswith("scp-article:"):
+            self.show_scp(event.href.removeprefix("scp-article:"))
 
     def find_article(self, slug):
         slug = slug.upper()
@@ -345,10 +341,10 @@ class SCPReader(App):
                 "Commands:\n"
                 "  SCP-###  - open an article\n"
                 "  ###      - open an article by number\n"
-                "  list     - browse articles in a clickable grid\n"
+                "  list     - show series and clickable article titles\n"
                 "  help     - show this help\n"
                 "  exit     - quit\n\n"
-                "Press Esc in an article or the list to go back."
+                "Article lists stay in terminal history. Press Esc in an article to return."
             )
         elif normalized == "list":
             self.list_scps()
