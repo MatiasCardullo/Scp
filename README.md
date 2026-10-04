@@ -36,12 +36,13 @@ A Textual TUI with a retro terminal look (dark background, green text, and keybo
 
 | Command | Action |
 |---|---|
-| `SCP-173` or `173` | Opens an article in a scrollable terminal view |
-| `list` | Shows articles in a clickable grid, with numbered SCPs first and special entries at the end |
+| `SCP-173` or `173` | Opens an article in its own scrollable tab |
+| `list` | Adds clickable, title-only article links to the terminal history, grouped under series titles |
+| `cls` | Clears the terminal history |
 | `help` | Shows the help message |
 | `exit` / `quit` | Closes the TUI |
 
-Click an article in the grid to open it. Press `Esc` in an article or the list to return to the previous screen. Articles are displayed as text; images and the original HTML layout are not rendered in the terminal.
+The Terminal tab keeps command history and clickable article lists. Opened articles appear in separate tabs; switch back to Terminal without losing its history. Reopening an article selects its existing tab. Images and the original HTML layout are not rendered in the terminal.
 
 ---
 

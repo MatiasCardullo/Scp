@@ -6,8 +6,15 @@ from bs4 import BeautifulSoup
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
-from textual.screen import Screen
-from textual.widgets import Footer, Header, Input, Markdown, Static
+from textual.widgets import (
+    Footer,
+    Header,
+    Input,
+    Markdown,
+    Static,
+    TabPane,
+    TabbedContent,
+)
 
 INDEX_PATH = os.path.join("scp_data", "index.json")
 HTML_EXPORT_FOLDER = os.path.join("scp_data", "html")
@@ -83,42 +90,6 @@ class CommandInput(Input):
         self.cursor_position = len(self.value)
 
 
-class ArticleScreen(Screen):
-    """Scrollable terminal view for a single SCP article."""
-
-    BINDINGS = [Binding("escape", "app.pop_screen", "Back")]
-
-    CSS = """
-    Screen {
-        background: #050805;
-        color: #33ff33;
-    }
-    #article-scroll {
-        height: 1fr;
-        border: round #1f7a1f;
-        margin: 0 1;
-        padding: 1 2;
-    }
-    #article-body {
-        color: #b6ffb6;
-    }
-    """
-
-    def __init__(self, slug, title, body):
-        super().__init__()
-        self.slug = slug
-        self.title = title
-        self.body = body
-
-    def compose(self) -> ComposeResult:
-        yield Header(show_clock=False)
-        yield VerticalScroll(
-            Static(f"{self.slug} - {self.title}\n\n{self.body}", id="article-body", markup=False),
-            id="article-scroll",
-        )
-        yield Footer()
-
-
 def scp_sort_key(slug):
     match = re.fullmatch(r"SCP-(\d+)(.*)", slug, re.IGNORECASE)
     if not match:
@@ -173,6 +144,18 @@ class SCPReader(App):
         width: 1fr;
         margin-bottom: 1;
     }
+    #terminal-tab {
+        height: 1fr;
+    }
+    .article-scroll {
+        height: 1fr;
+        border: round #1f7a1f;
+        margin: 1;
+        padding: 1 2;
+    }
+    .article-body {
+        color: #b6ffb6;
+    }
     CommandInput {
         margin: 0 1 1 1;
         border: round #1f7a1f;
@@ -183,11 +166,17 @@ class SCPReader(App):
         super().__init__()
         self.index_error = None
         self.index = self.load_index()
+        self.article_pane_ids = {}
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
-        yield VerticalScroll(id="output")
-        yield CommandInput(placeholder="Type help to see available commands", id="command")
+        with TabbedContent(id="workspace-tabs"):
+            with TabPane("Terminal", id="terminal-tab"):
+                yield VerticalScroll(id="output")
+                yield CommandInput(
+                    placeholder="Type help to see available commands",
+                    id="command",
+                )
         yield Footer()
 
     def on_mount(self):
@@ -267,10 +256,6 @@ class SCPReader(App):
             output.mount(Markdown(markdown, open_links=False))
         output.scroll_end(animate=False)
 
-    def on_markdown_link_clicked(self, event: Markdown.LinkClicked):
-        if event.href.startswith("scp-article:"):
-            self.show_scp(event.href.removeprefix("scp-article:"))
-
     def find_article(self, slug):
         slug = slug.upper()
         if self.index is not None:
@@ -315,45 +300,74 @@ class SCPReader(App):
                     self.write_output(f"[{filename}] Error: {error}")
         return None
 
-    def show_scp(self, slug):
+    async def show_scp(self, slug):
         slug = slug.upper()
         article = self.find_article(slug)
         if article is None:
             self.write_output("SCP article not found.")
             return
         title, body = article
-        self.push_screen(ArticleScreen(slug, title, body))
+        tabs = self.query_one("#workspace-tabs", TabbedContent)
+        pane_id = self.article_pane_ids.get(slug)
+        if pane_id is None:
+            pane_id = f"article-{len(self.article_pane_ids) + 1}"
+            article_view = VerticalScroll(
+                Static(
+                    f"{slug} - {title}\n\n{body}",
+                    classes="article-body",
+                    markup=False,
+                ),
+                classes="article-scroll",
+            )
+            await tabs.add_pane(TabPane(title, article_view, id=pane_id))
+            self.article_pane_ids[slug] = pane_id
+        self.set_focus(None)
+        tabs.active = pane_id
 
-    def on_input_submitted(self, event: Input.Submitted):
+    async def on_input_submitted(self, event: Input.Submitted):
         command = event.value.strip()
         event.input.value = ""
         event.input.remember(command)
         if command:
             self.write_output(f"> {command}")
-        self.handle_command(command)
+        await self.handle_command(command)
 
-    def handle_command(self, command):
+    async def handle_command(self, command):
         normalized = command.lower()
         if normalized in ("exit", "quit"):
             self.exit()
+        elif normalized == "cls":
+            await self.query_one("#output", VerticalScroll).remove_children()
         elif normalized == "help":
             self.write_output(
                 "Commands:\n"
                 "  SCP-###  - open an article\n"
                 "  ###      - open an article by number\n"
                 "  list     - show series and clickable article titles\n"
+                "  cls      - clear the terminal history\n"
                 "  help     - show this help\n"
                 "  exit     - quit\n\n"
-                "Article lists stay in terminal history. Press Esc in an article to return."
+                "Use the tabs to switch between the terminal and open articles."
             )
         elif normalized == "list":
             self.list_scps()
         elif command.upper().startswith("SCP-"):
-            self.show_scp(command)
+            await self.show_scp(command)
         elif command.isdigit() and 1 <= int(command) <= 9999:
-            self.show_scp(f"SCP-{int(command):03}")
+            await self.show_scp(f"SCP-{int(command):03}")
         elif command:
             self.write_output("Unknown command. Type 'help'.")
+
+    async def on_markdown_link_clicked(self, event: Markdown.LinkClicked):
+        if event.href.startswith("scp-article:"):
+            await self.show_scp(event.href.removeprefix("scp-article:"))
+
+    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated):
+        if (
+            event.tabbed_content.id == "workspace-tabs"
+            and event.tabbed_content.active == "terminal-tab"
+        ):
+            self.query_one("#command", CommandInput).focus()
 
 
 if __name__ == "__main__":
