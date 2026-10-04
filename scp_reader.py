@@ -1,429 +1,364 @@
-from PyQt5.QtWidgets import (QMainWindow, QApplication, QWidget, QVBoxLayout,
-                              QHBoxLayout, QPlainTextEdit, QLineEdit, QLabel)
-from PyQt5.QtCore import Qt, QTimer, QUrl
-from PyQt5.QtGui import QPainter, QColor
-import re, sys, os, json
+import json
+import os
+import re
+
 from bs4 import BeautifulSoup
-from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import VerticalScroll
+from textual.screen import Screen
+from textual.widgets import Footer, Header, Input, Markdown, RichLog, Static
 
 INDEX_PATH = os.path.join("scp_data", "index.json")
 HTML_EXPORT_FOLDER = os.path.join("scp_data", "html")
-LINK_SCHEME = "scp-ref:"  # esquema custom para interceptar clicks internos
-
-# matchea el formato de href que genera scp_loader.py para links entre
-# articulos ya procesados: '../carpeta/SLUG.html'
-INTERNAL_HREF_RE = re.compile(r'^\.\./([^/]+)/([^/]+)\.html$', re.IGNORECASE)
-
-# CSS inyectado en cada artículo para que la ventana del visor mantenga
-# la estética terminal (fondo negro, texto verde) en vez del blanco por defecto.
-ARTICLE_THEME = """
-<style>
-  body {
-    background:#0a0a0a;
-    color:#33ff33;
-    font-family:'Courier New', monospace;
-    line-height:1.6;
-    padding:24px;
-  }
-  a { color:#8dff8d; cursor:pointer; }
-  a:visited { color:#5fcf5f; }
-  a.scp-ref { text-decoration: underline dotted; }
-  img { max-width:100%; filter:saturate(0.7); }
-  hr { border-color:#1f4d1f; }
-  ::selection { background:#145214; color:#eaffea; }
-  table, td, th { border-color:#1f4d1f; }
-</style>
-"""
+JSON_FOLDER = os.path.join("scp_data", "json")
 
 
-def rewrite_internal_links(html):
-    """Convierte los href relativos '../carpeta/SLUG.html' que ya vienen
-    armados por scp_loader.py al esquema scp-ref: para que SCPLinkPage
-    los intercepte y abra el articulo dentro de la app."""
+def html_to_text(html):
+    """Convert article HTML into readable terminal text."""
     soup = BeautifulSoup(html, "html.parser")
-    for a in soup.find_all("a", href=True):
-        m = INTERNAL_HREF_RE.match(a["href"].strip())
-        if m:
-            slug = m.group(2)
-            a["href"] = f"{LINK_SCHEME}{slug}"
-    return str(soup)
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+
+    for image in soup.find_all("img"):
+        alt = image.get("alt", "").strip()
+        image.replace_with(f"\n[Image: {alt}]\n" if alt else "\n")
+
+    for tag in soup.find_all(["br", "hr"]):
+        tag.replace_with("\n")
+    for tag in soup.find_all(["p", "div", "h1", "h2", "h3", "h4", "li", "tr", "blockquote"]):
+        tag.insert_before("\n")
+        tag.insert_after("\n")
+
+    lines = []
+    for line in soup.get_text().splitlines():
+        line = re.sub(r"[ \t]+", " ", line).strip()
+        if line:
+            lines.append(line)
+        elif lines and lines[-1]:
+            lines.append("")
+    return "\n".join(lines).strip()
 
 
-def linkify_scp_refs(html, known_slugs, current_slug=None):
-    """Fallback para cuando todavia no existe el HTML pre-procesado por el
-    loader: busca menciones tipo 'SCP-173' en el texto y las convierte en
-    links clickeables (esquema scp-ref:) hacia artículos que SÍ tenemos
-    indexados localmente. No linkea menciones al propio artículo leído."""
-    soup = BeautifulSoup(html, "html.parser")
+class CommandInput(Input):
+    """Command input with history navigable using ↑ and ↓."""
 
-    def replace(text):
-        def sub(m):
-            slug = m.group(1).upper()
-            if slug in known_slugs and slug != current_slug:
-                return f'<a class="scp-ref" href="{LINK_SCHEME}{slug}">{m.group(1)}</a>'
-            return m.group(1)
-        return re.sub(r'\b(SCP-\d{1,4})\b', sub, text)
+    BINDINGS = [
+        Binding("up", "history_previous", show=False),
+        Binding("down", "history_next", show=False),
+    ]
 
-    for tag in soup.find_all(string=True):
-        if tag.parent.name in ("script", "style", "a"):
-            continue
-        new_html = replace(str(tag))
-        if new_html != str(tag):
-            tag.replace_with(BeautifulSoup(new_html, "html.parser"))
-
-    return str(soup)
-
-
-class SCPLinkPage(QWebEnginePage):
-    """QWebEnginePage que intercepta clicks a links internos (scp-ref:SLUG)
-    y los redirige a un callback en vez de intentar navegar de verdad."""
-    def __init__(self, open_callback, parent=None):
-        super().__init__(parent)
-        self.open_callback = open_callback
-
-    def acceptNavigationRequest(self, url, nav_type, is_main_frame):
-        url_str = url.toString()
-        if url_str.startswith(LINK_SCHEME):
-            slug = url_str[len(LINK_SCHEME):]
-            if self.open_callback:
-                self.open_callback(slug)
-            return False
-        return super().acceptNavigationRequest(url, nav_type, is_main_frame)
-
-
-class SCPViewer(QMainWindow):
-    def __init__(self, title, html, known_slugs=None, open_callback=None,
-                 current_slug=None, base_dir=None):
-        super().__init__()
-        self.setWindowTitle(title)
-        self.resize(800, 600)
-
-        if known_slugs:
-            # fallback en vivo: no habia HTML pre-procesado
-            html = linkify_scp_refs(html, known_slugs, current_slug=current_slug)
-
-        view = QWebEngineView()
-        if open_callback:
-            view.setPage(SCPLinkPage(open_callback, view))
-
-        # base_dir: para que las imagenes relativas ('../images/x.jpg') del
-        # HTML pre-procesado por el loader carguen solas desde disco
-        base_url = QUrl.fromLocalFile(base_dir + os.sep) if base_dir else QUrl()
-        view.setHtml(ARTICLE_THEME + html, baseUrl=base_url)
-        self.setCentralWidget(view)
-
-class HistoryLineEdit(QLineEdit):
-    """QLineEdit con historial de comandos navegable con ↑ / ↓, estilo shell."""
-    def __init__(self):
-        super().__init__()
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.history = []
-        self.history_index = -1  # -1 = no estamos navegando historial
-        self._draft = ""  # lo que se estaba tipeando antes de subir al historial
-
-    def push_history(self, cmd):
-        if cmd and (not self.history or self.history[-1] != cmd):
-            self.history.append(cmd)
         self.history_index = -1
-        self._draft = ""
+        self.draft = ""
 
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Up:
-            if self.history:
-                if self.history_index == -1:
-                    self._draft = self.text()
-                    self.history_index = len(self.history) - 1
-                elif self.history_index > 0:
-                    self.history_index -= 1
-                self.setText(self.history[self.history_index])
-                self.end(False)
+    def remember(self, command):
+        if command and (not self.history or self.history[-1] != command):
+            self.history.append(command)
+        self.history_index = -1
+        self.draft = ""
+
+    def action_history_previous(self):
+        if not self.history:
             return
-        elif event.key() == Qt.Key_Down:
-            if self.history_index != -1:
-                if self.history_index < len(self.history) - 1:
-                    self.history_index += 1
-                    self.setText(self.history[self.history_index])
-                else:
-                    self.history_index = -1
-                    self.setText(self._draft)
-                self.end(False)
+        if self.history_index == -1:
+            self.draft = self.value
+            self.history_index = len(self.history) - 1
+        elif self.history_index > 0:
+            self.history_index -= 1
+        self.value = self.history[self.history_index]
+        self.cursor_position = len(self.value)
+
+    def action_history_next(self):
+        if self.history_index == -1:
             return
-        super().keyPressEvent(event)
+        if self.history_index < len(self.history) - 1:
+            self.history_index += 1
+            self.value = self.history[self.history_index]
+        else:
+            self.history_index = -1
+            self.value = self.draft
+        self.cursor_position = len(self.value)
 
 
-class ScanlineOverlay(QWidget):
-    """Overlay transparente con líneas horizontales tenues, tipo monitor CRT.
-    No intercepta clicks ni foco: solo se dibuja encima."""
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.setAttribute(Qt.WA_TransparentForMouseEvents)
-        self.setAttribute(Qt.WA_NoSystemBackground)
+class ArticleScreen(Screen):
+    """Scrollable terminal view for a single SCP article."""
 
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        line_color = QColor(0, 0, 0, 45)
-        painter.setPen(line_color)
-        for y in range(0, self.height(), 3):
-            painter.drawLine(0, y, self.width(), y)
-        # leve viñeta en los bordes
-        vignette = QColor(0, 0, 0, 60)
-        painter.setPen(vignette)
-        painter.drawRect(0, 0, self.width() - 1, self.height() - 1)
+    BINDINGS = [Binding("escape", "app.pop_screen", "Back")]
 
+    CSS = """
+    Screen {
+        background: #050805;
+        color: #33ff33;
+    }
+    #article-scroll {
+        height: 1fr;
+        border: round #1f7a1f;
+        margin: 0 1;
+        padding: 1 2;
+    }
+    #article-body {
+        color: #b6ffb6;
+    }
+    """
 
-class SCPTextArea(QPlainTextEdit):
-    def __init__(self, input_field):
+    def __init__(self, slug, title, body):
         super().__init__()
-        self.input_field = input_field
+        self.slug = slug
+        self.title = title
+        self.body = body
 
-    def mouseReleaseEvent(self, event):
-        super().mouseReleaseEvent(event)
-        cursor = self.textCursor()
-        if not cursor.hasSelection():
-            # si no hay selección, devolver foco al input
-            self.input_field.setFocus()
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=False)
+        yield VerticalScroll(
+            Static(f"{self.slug} - {self.title}\n\n{self.body}", id="article-body", markup=False),
+            id="article-scroll",
+        )
+        yield Footer()
 
-class TerminalEmu(QWidget):
+
+class SCPListScreen(Screen):
+    BINDINGS = [Binding("escape", "app.pop_screen", "Back")]
+
+    CSS = """
+    Screen {
+        background: #050805;
+        color: #33ff33;
+    }
+    #list-scroll {
+        height: 1fr;
+        border: round #1f7a1f;
+        margin: 0 1;
+        padding: 1;
+    }
+    #scp-grid {
+        padding: 0 1;
+    }
+    """
+
+    def __init__(self, articles):
+        super().__init__()
+        self.articles = articles
+        self.link_to_slug = {
+            str(index): slug for index, (slug, _) in enumerate(articles)
+        }
+
+    def compose(self) -> ComposeResult:
+        links = []
+        for index, (slug, title) in enumerate(self.articles):
+            label = f"{slug} - {title}"
+            label = label.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+            links.append(f"[{label}](scp-article:{index})")
+        rows = [
+            "    ".join(links[index:index + 4])
+            for index in range(0, len(links), 4)
+        ]
+        yield Header(show_clock=False)
+        yield VerticalScroll(
+            Markdown("\n\n".join(rows), id="scp-grid", open_links=False),
+            id="list-scroll",
+        )
+        yield Footer()
+
+    def on_markdown_link_clicked(self, event: Markdown.LinkClicked):
+        if not event.href.startswith("scp-article:"):
+            return
+        slug = self.link_to_slug.get(event.href.removeprefix("scp-article:"))
+        if slug:
+            self.app.show_scp(slug)
+
+
+def scp_sort_key(slug):
+    match = re.fullmatch(r"SCP-(\d+)(.*)", slug, re.IGNORECASE)
+    if not match:
+        return (1, float("inf"), slug.casefold(), slug.casefold())
+    number, suffix = match.groups()
+    return (bool(suffix), int(number), suffix.casefold(), slug.casefold())
+
+
+class SCPReader(App):
+    TITLE = "SCP Terminal Reader"
+    SUB_TITLE = "SCP-OS"
+
+    BINDINGS = [Binding("ctrl+c", "quit", "Quit", show=True)]
+
+    CSS = """
+    Screen {
+        background: #050805;
+        color: #33ff33;
+    }
+    Header, Footer {
+        background: #0b190b;
+        color: #58ff58;
+    }
+    #output {
+        height: 1fr;
+        border: round #1f7a1f;
+        margin: 0 1;
+        padding: 0 1;
+        scrollbar-color: #1f7a1f;
+    }
+    CommandInput {
+        margin: 0 1 1 1;
+        border: round #1f7a1f;
+    }
+    """
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SCP Terminal Reader")
-        self.resize(800, 600)
-
-        # Estilos retro
-        self.setStyleSheet("""
-            QWidget {
-                background-color: black;
-                color: lime;
-                font-family: 'Courier New', monospace;
-                font-size: 14px;
-            }
-            QPlainTextEdit, QLineEdit {
-                background-color: black;
-                color: lime;
-                border: none;
-                padding: 0px;
-                margin: 0px;
-            }
-            QLabel#prompt {
-                color: lime;
-                padding-right: 4px;
-            }
-        """)
-
-        self.prompt_label = QLabel("SCP-OS>")
-        self.prompt_label.setObjectName("prompt")
-
-        self.input = HistoryLineEdit()
-        self.output = SCPTextArea(self.input)
-        self.output.setReadOnly(True)
-
-        self.input.returnPressed.connect(self.handle_command)
-
-        # --- efecto de tipeo letra por letra (debe existir antes de cualquier append_output) ---
-        self.output_queue = []
-        self.pending_text = ""
-        self.chars_per_tick = 1
-        self.type_timer = QTimer(self)
-        self.type_timer.setInterval(12)
-        self.type_timer.timeout.connect(self._type_tick)
-
+        self.index_error = None
         self.index = self.load_index()
-        self.open_windows = []  # mantiene vivas las ventanas de artículos abiertas
 
-        input_row = QHBoxLayout()
-        input_row.setContentsMargins(4, 2, 4, 4)
-        input_row.setSpacing(0)
-        input_row.addWidget(self.prompt_label)
-        input_row.addWidget(self.input)
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=False)
+        yield RichLog(id="output", wrap=True, markup=False, highlight=False)
+        yield CommandInput(placeholder="Type help to see available commands", id="command")
+        yield Footer()
 
-        layout = QVBoxLayout()
-        layout.setContentsMargins(4, 4, 0, 0)
-        layout.setSpacing(0)
-        layout.addWidget(self.output)
-        layout.addLayout(input_row)
-        self.setLayout(layout)
-
-        # Overlay de scanlines: se crea al final, encima de todo el layout
-        self.scanlines = ScanlineOverlay(self)
-        self.scanlines.setGeometry(self.rect())
-        self.scanlines.raise_()
-        self.scanlines.show()
-
-        self.input.setFocus()  # foco inicial
-
+    def on_mount(self):
         if self.index:
-            self.append_output(f"Bienvenido al SCP Reader. {len(self.index)} artículos indexados. Escribí 'help' para comenzar.")
+            self.write_output(
+                f"Welcome to the SCP Reader. {len(self.index)} articles indexed. "
+                "Type 'help' to get started."
+            )
         else:
-            self.append_output("Bienvenido al SCP Reader. ⚠ No se encontró scp_data/index.json — corré scp_loader.py primero.")
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        if hasattr(self, "scanlines"):
-            self.scanlines.setGeometry(self.rect())
+            self.write_output(
+                "Welcome to the SCP Reader. scp_data/index.json was not found; "
+                "run scp_loader.py first."
+            )
+        if self.index_error:
+            self.write_output(f"[index.json] Error: {self.index_error}")
+        self.query_one("#command", CommandInput).focus()
 
     def load_index(self):
-        """Carga el índice liviano generado por scp_loader.py (slug -> title/folder/json_file).
-        Si no existe (dataset viejo), devuelve None y se usa el fallback lento."""
         if not os.path.exists(INDEX_PATH):
             return None
         try:
-            with open(INDEX_PATH, encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            self.append_output(f"[index.json] error: {e}")
+            with open(INDEX_PATH, encoding="utf-8") as file:
+                return json.load(file)
+        except (OSError, json.JSONDecodeError) as error:
+            self.index_error = error
             return None
 
-    def list_scps(self):
-        if self.index:
-            titles = sorted(v["title"] for v in self.index.values())
-            self.append_output("\t\t".join(titles) if titles else "No se encontraron SCPs.")
-            return
+    def write_output(self, text):
+        self.query_one("#output", RichLog).write(text)
 
-        # Fallback sin índice: recorre todos los json (lento)
-        entries = []
-        for root, dirs, files in os.walk("scp_data"):
-            for fname in files:
-                if not fname.endswith(".json"): continue
-                path = os.path.join(root, fname)
+    def list_scps(self):
+        if self.index is not None:
+            articles = [
+                (slug, entry.get("title", slug))
+                for slug, entry in self.index.items()
+            ]
+        else:
+            articles = []
+            for root, _, files in os.walk("scp_data"):
+                for filename in files:
+                    if not filename.endswith(".json"):
+                        continue
+                    path = os.path.join(root, filename)
+                    try:
+                        with open(path, encoding="utf-8") as file:
+                            data = json.load(file)
+                        articles.extend(
+                            (slug, entry["title"])
+                            for slug, entry in data.items()
+                            if slug.startswith("SCP-") and entry.get("title")
+                        )
+                    except (OSError, json.JSONDecodeError) as error:
+                        self.write_output(f"[{filename}] Error: {error}")
+
+        if not articles:
+            self.write_output("No SCP articles were found.")
+            return
+        articles.sort(key=lambda article: scp_sort_key(article[0]))
+        self.push_screen(SCPListScreen(articles))
+
+    def find_article(self, slug):
+        slug = slug.upper()
+        if self.index is not None:
+            meta = self.index.get(slug)
+            if not meta:
+                return None
+
+            html_path = os.path.join(
+                HTML_EXPORT_FOLDER, meta["folder"], f"{slug}.html"
+            )
+            if os.path.exists(html_path):
                 try:
-                    with open(path, encoding="utf-8") as f:
-                        data = json.load(f)
-                    for key in data.keys():
-                        if key.startswith("SCP-") and data[key].get("title"):
-                            entries.append(data[key]["title"])
-                except Exception as e:
-                    self.append_output(f"[{fname}] error: {e}")
-        self.append_output("\t\t".join(sorted(entries)) if entries else "No se encontraron SCPs.")
+                    with open(html_path, encoding="utf-8") as file:
+                        return meta["title"], html_to_text(file.read())
+                except OSError as error:
+                    self.write_output(f"Error reading {html_path}: {error}")
+                    return None
+
+            json_path = os.path.join(JSON_FOLDER, meta["json_file"])
+            try:
+                with open(json_path, encoding="utf-8") as file:
+                    entry = json.load(file)[slug]
+            except (OSError, json.JSONDecodeError, KeyError) as error:
+                self.write_output(f"Error reading {meta['json_file']}: {error}")
+                return None
+            html = entry.get("raw_content") or entry.get("raw_source", "")
+            return meta["title"], html_to_text(html)
+
+        for root, _, files in os.walk("scp_data"):
+            for filename in files:
+                if not filename.endswith(".json"):
+                    continue
+                path = os.path.join(root, filename)
+                try:
+                    with open(path, encoding="utf-8") as file:
+                        data = json.load(file)
+                    if slug in data:
+                        entry = data[slug]
+                        html = entry.get("raw_content") or entry.get("raw_source", "")
+                        return entry.get("title", slug), html_to_text(html)
+                except (OSError, json.JSONDecodeError) as error:
+                    self.write_output(f"[{filename}] Error: {error}")
+        return None
 
     def show_scp(self, slug):
         slug = slug.upper()
+        article = self.find_article(slug)
+        if article is None:
+            self.write_output("SCP article not found.")
+            return
+        title, body = article
+        self.push_screen(ArticleScreen(slug, title, body))
 
-        if self.index:
-            meta = self.index.get(slug)
-            if not meta:
-                self.append_output("SCP no encontrado.")
-                return
-            title = meta["title"]
-            html_path = os.path.join(HTML_EXPORT_FOLDER, meta["folder"], f"{slug}.html")
+    def on_input_submitted(self, event: Input.Submitted):
+        command = event.value.strip()
+        event.input.value = ""
+        event.input.remember(command)
+        if command:
+            self.write_output(f"> {command}")
+        self.handle_command(command)
 
-            # preferir el HTML ya procesado por el loader (links e imagenes resueltos)
-            if os.path.exists(html_path):
-                try:
-                    with open(html_path, encoding="utf-8") as f:
-                        html = f.read()
-                except Exception as e:
-                    self.append_output(f"Error leyendo {html_path}: {e}")
-                    return
-                html = rewrite_internal_links(html)
-                base_dir = os.path.dirname(os.path.abspath(html_path))
-                self.setWindowTitle(f"{slug} - {title}")
-                viewer = SCPViewer(
-                    f"{slug} - {title}", html,
-                    open_callback=self.show_scp,
-                    base_dir=base_dir,
-                )
-                self.open_windows.append(viewer)
-                viewer.show()
-                self.append_output(f"{slug} abierto en ventana aparte.")
-                return
-
-            # fallback: todavia no se genero el HTML estatico para este articulo
-            json_path = os.path.join("scp_data", "json", meta["json_file"])
-            try:
-                with open(json_path, encoding="utf-8") as f:
-                    data = json.load(f)
-                entry = data[slug]
-            except Exception as e:
-                self.append_output(f"Error leyendo {meta['json_file']}: {e}")
-                return
-            html = entry.get("raw_content") or entry.get("raw_source", "")
-            self.setWindowTitle(f"{slug} - {title}")
-            viewer = SCPViewer(
-                f"{slug} - {title}", html,
-                known_slugs=self.index.keys(),
-                open_callback=self.show_scp,
-                current_slug=slug,
+    def handle_command(self, command):
+        normalized = command.lower()
+        if normalized in ("exit", "quit"):
+            self.exit()
+        elif normalized == "help":
+            self.write_output(
+                "Commands:\n"
+                "  SCP-###  - open an article\n"
+                "  ###      - open an article by number\n"
+                "  list     - browse articles in a clickable grid\n"
+                "  help     - show this help\n"
+                "  exit     - quit\n\n"
+                "Press Esc in an article or the list to go back."
             )
-            self.open_windows.append(viewer)
-            viewer.show()
-            self.append_output(f"{slug} abierto en ventana aparte (sin HTML pre-procesado, corré scp_loader.py).")
-            return
-
-        # Fallback sin índice: recorre todos los json (lento)
-        for root, dirs, files in os.walk("scp_data"):
-            for fname in files:
-                if not fname.endswith(".json"):
-                    continue
-                path = os.path.join(root, fname)
-                try:
-                    with open(path, encoding="utf-8") as f:
-                        data = json.load(f)
-                    if slug in data:
-                        entry = data[slug]
-                        title = entry.get("title", slug)
-                        html = entry.get("raw_content") or entry.get("raw_source", "")
-                        self.setWindowTitle(f"{slug} - {title}")
-                        viewer = SCPViewer(f"{slug} - {title}", html)
-                        self.open_windows.append(viewer)
-                        viewer.show()
-                        self.append_output(f"{slug} abierto en ventana aparte.")
-                        return
-                except Exception as e:
-                    self.append_output(f"[{fname}] error: {e}")
-        self.append_output("SCP no encontrado.")
-    
-    def append_output(self, text):
-        """Encola el texto para que se muestre con efecto de tipeo letra por letra."""
-        self.output_queue.append(text)
-        if not self.type_timer.isActive():
-            self._start_next_typing()
-
-    def _start_next_typing(self):
-        if not self.output_queue:
-            return
-        text = self.output_queue.pop(0)
-        if self.output.toPlainText():
-            self.output.insertPlainText("\n")
-        self.pending_text = text
-        # velocidad adaptativa: los textos largos (ej. 'list') tipean varios
-        # caracteres por tick para no volverse eterno, sin perder el efecto
-        self.chars_per_tick = max(1, len(text) // 60)
-        self.type_timer.start()
-
-    def _type_tick(self):
-        if not self.pending_text:
-            self.type_timer.stop()
-            self._start_next_typing()
-            return
-        chunk, self.pending_text = (
-            self.pending_text[: self.chars_per_tick],
-            self.pending_text[self.chars_per_tick :],
-        )
-        self.output.insertPlainText(chunk)
-        scrollbar = self.output.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
-
-    def handle_command(self):
-        cmd = self.input.text().strip()
-        self.input.push_history(cmd)
-        self.input.clear()
-        self.append_output(f"> {cmd}")
-
-        if cmd.lower() in ("exit", "quit"):
-            self.append_output("Saliendo...")
-            QApplication.quit()
-        elif cmd.lower() == "help":
-            self.append_output("Comandos:\n  SCP-###  - ver entrada\n  list     - listar archivos\n  exit     - salir")
-        elif cmd.lower() == "list":
+        elif normalized == "list":
             self.list_scps()
-        elif cmd.upper().startswith("SCP-"):
-            self.show_scp(cmd)
-        elif cmd.isdigit() and 1 <= int(cmd) <= 9999:
-            self.show_scp(f"SCP-{int(cmd):03}")
-        else:
-            self.append_output("Comando no reconocido. Escribí 'help'.")
+        elif command.upper().startswith("SCP-"):
+            self.show_scp(command)
+        elif command.isdigit() and 1 <= int(command) <= 9999:
+            self.show_scp(f"SCP-{int(command):03}")
+        elif command:
+            self.write_output("Unknown command. Type 'help'.")
+
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = TerminalEmu()
-    window.show()
-    sys.exit(app.exec_())
+    SCPReader().run()

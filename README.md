@@ -1,68 +1,70 @@
 # SCP Terminal Archive
 
-Un mini-sistema de dos partes para descargar, catalogar y leer artículos de la [Wikidot SCP Foundation](http://www.scpwiki.com/) en formato local, con una interfaz retro tipo terminal.
+A two-part tool for downloading, cataloging, and reading articles from the [Wikidot SCP Foundation](http://www.scpwiki.com/) locally, with a retro terminal-style interface.
 
 ```
-📥 scp_loader.py   →  descarga y arma el archivo local (JSON + HTML + imágenes)
-🖥️  scp_reader.py   →  terminal retro para buscar y leer los artículos descargados
+📥 scp_loader.py   →  downloads and builds the local archive (JSON + HTML + images)
+🖥️  scp_reader.py   →  retro terminal for searching and reading downloaded articles
 ```
 
 ---
 
-## ¿Qué hace cada script?
+## What each script does
 
 ### `scp_loader.py`
-Descarga el dataset público de [scp-data.tedivm.com](https://scp-data.tedivm.com/) y genera un archivo local navegable:
+Downloads the public dataset from [scp-data.tedivm.com](https://scp-data.tedivm.com/) and creates a browsable local archive:
 
-- Descarga el índice de contenidos y todos los `.json` con los artículos (por serie/carpeta).
-- Parsea el HTML de cada artículo con BeautifulSoup.
-- Reemplaza las referencias tipo `SCP-###` por links internos hacia el artículo correspondiente.
-- Descarga las imágenes referenciadas en paralelo (10 workers) y las guarda localmente, reescribiendo los `src`.
-- Guarda todo en `scp_data/` con esta estructura:
+- Downloads the content index and all article `.json` files (organized by series/folder).
+- Parses each article's HTML with BeautifulSoup.
+- Replaces `SCP-###` references with internal links to the corresponding article.
+- Downloads referenced images in parallel (4 workers) and saves them locally, updating their `src` attributes.
+- Saves everything under `scp_data/` using this structure:
 
 ```
 scp_data/
-├── json/       # JSONs originales descargados
-├── html/       # HTML procesado, organizado por serie
+├── json/       # Original downloaded JSON files
+├── html/       # Processed HTML, organized by series
 │   └── series-1/
 │       └── scp-173.html
-└── images/     # Imágenes descargadas
+└── images/     # Downloaded images
 ```
 
 ### `scp_reader.py`
-Una app de escritorio (PyQt5) con estética de terminal retro (fondo negro, texto verde, fuente monoespaciada) para navegar el archivo generado por `scp_loader.py`.
+A Textual TUI with a retro terminal look (dark background, green text, and keyboard navigation) for searching and reading the archive created by `scp_loader.py`.
 
-**Comandos disponibles:**
+**Available commands:**
 
-| Comando | Acción |
+| Command | Action |
 |---|---|
-| `SCP-173` o `173` | Abre el artículo en una ventana aparte (render HTML) |
-| `list` | Lista todos los títulos encontrados en `scp_data/` |
-| `help` | Muestra la ayuda |
-| `exit` / `quit` | Cierra la app |
+| `SCP-173` or `173` | Opens an article in a scrollable terminal view |
+| `list` | Shows articles in a clickable grid, with numbered SCPs first and special entries at the end |
+| `help` | Shows the help message |
+| `exit` / `quit` | Closes the TUI |
+
+Click an article in the grid to open it. Press `Esc` in an article or the list to return to the previous screen. Articles are displayed as text; images and the original HTML layout are not rendered in the terminal.
 
 ---
 
-## Requisitos
+## Requirements
 
 ```bash
-pip install requests beautifulsoup4 PyQt5 PyQtWebEngine
+pip install -r requirements.txt
 ```
 
-## Uso
+## Usage
 
 ```bash
-# 1. Descargar y armar el archivo local (puede tardar varios minutos)
+# 1. Download and build the local archive (may take several minutes)
 python scp_loader.py
 
-# 2. Levantar el lector terminal
+# 2. Start the TUI reader
 python scp_reader.py
 ```
 
 ---
 
-## Notas / limitaciones actuales
+## Current notes / limitations
 
-- `scp_loader.py` no tiene reintentos automáticos ante fallos de red; si una descarga falla, salta ese archivo y sigue.
-- `scp_reader.py` recorre todos los `.json` de `scp_data/` en cada búsqueda (`list`, `show_scp`) — funciona bien pero no escala si el archivo crece mucho (ver sugerencias abajo).
-- Los links internos entre SCPs se arman durante la descarga, no al momento de leer.
+- `scp_loader.py` does not automatically retry network failures; if a download fails, that file is skipped and processing continues.
+- If `scp_data/index.json` is missing, `scp_reader.py` searches for articles by walking the `.json` files under `scp_data/`; searches are direct when the index is available.
+- Internal links between SCPs are created during downloading, not when reading.
