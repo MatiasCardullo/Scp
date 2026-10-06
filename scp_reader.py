@@ -13,6 +13,7 @@ from textual.widgets import (
     Header,
     Input,
     Markdown,
+    ProgressBar,
     Static,
     TabPane,
     TabbedContent,
@@ -197,6 +198,13 @@ class SCPReader(App):
         with TabbedContent(id="workspace-tabs"):
             with TabPane("Terminal", id="terminal-tab"):
                 yield VerticalScroll(id="output")
+                yield Static(id="update-status")
+                yield ProgressBar(
+                    total=100,
+                    show_eta=False,
+                    show_percentage=True,
+                    id="update-progress",
+                )
                 yield CommandInput(
                     placeholder="Type help to see available commands",
                     id="command",
@@ -204,6 +212,8 @@ class SCPReader(App):
         yield Footer()
 
     def on_mount(self):
+        self.query_one("#update-status", Static).display = False
+        self.query_one("#update-progress", ProgressBar).display = False
         if self.index:
             self.write_output(
                 f"Welcome to the SCP. {len(self.index)} articles indexed. "
@@ -371,6 +381,7 @@ class SCPReader(App):
                 "  SCP-###  - open an article\n"
                 "  ###      - open an article by number\n"
                 "  list     - show series and clickable article titles\n"
+                "  update   - run the loader and refresh the archive index\n"
                 "  cls      - clear the terminal history\n"
                 "  help     - show this help\n"
                 "  exit     - quit\n\n"
@@ -379,12 +390,104 @@ class SCPReader(App):
             )
         elif normalized == "list":
             self.list_scps()
+        elif normalized == "update":
+            await self.update_archive()
         elif command.upper().startswith("SCP-"):
             await self.show_scp(command)
         elif command.isdigit() and 1 <= int(command) <= 9999:
             await self.show_scp(f"SCP-{int(command):03}")
         elif command:
             self.write_output("Unknown command. Type 'help'.")
+
+    async def update_archive(self):
+        loader_path = os.path.join(os.path.dirname(__file__), "scp_loader.py")
+        self.write_output("Starting SCP archive update...")
+        status = self.query_one("#update-status", Static)
+        progress = self.query_one("#update-progress", ProgressBar)
+        status.display = True
+        progress.display = True
+        status.update("Starting loader...")
+        progress.update(progress=0)
+        try:
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-u",
+                loader_path,
+                "--textual-progress",
+                cwd=os.path.dirname(__file__),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+        except OSError as error:
+            status.display = False
+            progress.display = False
+            self.write_output(f"Could not start scp_loader.py: {error}")
+            return
+
+        if process.stdout is not None:
+            while True:
+                line = await process.stdout.readline()
+                if not line:
+                    break
+                output = line.decode(errors="replace").strip()
+                if output:
+                    self.handle_loader_output(output)
+
+        return_code = await process.wait()
+        if return_code:
+            status.display = False
+            progress.display = False
+            self.write_output(f"Archive update failed (exit code {return_code}).")
+            return
+
+        self.index_error = None
+        self.index = self.load_index()
+        if self.index is None:
+            status.display = False
+            progress.display = False
+            error = f": {self.index_error}" if self.index_error else ""
+            self.write_output(f"Loader finished, but the article index is unavailable{error}.")
+            return
+        status.display = False
+        progress.display = False
+        self.write_output(f"Archive updated. {len(self.index)} articles indexed.")
+
+    def handle_loader_output(self, output):
+        try:
+            event = json.loads(output)
+        except json.JSONDecodeError:
+            self.write_output(output)
+            return
+        if not isinstance(event, dict) or event.get("event") != "progress":
+            self.write_output(output)
+            return
+
+        completed = event.get("completed")
+        total = event.get("total")
+        stage = event.get("stage")
+        if not isinstance(completed, int) or not isinstance(total, int) or not isinstance(stage, str):
+            self.write_output(output)
+            return
+
+        percent = completed * 100 / total if total > 0 else 100
+        self.query_one("#update-status", Static).update(
+            f"{stage}: {completed}/{total}"
+        )
+        self.query_one("#update-progress", ProgressBar).update(progress=percent)
+
+    async def action_close_active_tab(self):
+        tabs = self.query_one("#workspace-tabs", TabbedContent)
+        pane_id = tabs.active
+        if pane_id == "terminal-tab":
+            self.exit()
+            return
+
+        await tabs.remove_pane(pane_id)
+        for slug, article_pane_id in list(self.article_pane_ids.items()):
+            if article_pane_id == pane_id:
+                del self.article_pane_ids[slug]
+                break
+        self.query_one("#command", CommandInput).focus()
 
     async def on_markdown_link_clicked(self, event: Markdown.LinkClicked):
         if event.href.startswith("scp-article:"):

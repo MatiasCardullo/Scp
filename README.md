@@ -38,6 +38,7 @@ A Textual TUI with a retro terminal look (dark background, green text, and keybo
 |---|---|
 | `SCP-173` or `173` | Opens an article in its own scrollable tab |
 | `list` | Adds clickable, title-only article links to the terminal history, grouped under series titles |
+| `update` | Runs `scp_loader.py`, shows live progress in a single status bar, and reloads the article index when it finishes |
 | `cls` | Clears the terminal history |
 | `help` | Shows the help message |
 | `exit` / `quit` | Closes the TUI |
@@ -62,7 +63,7 @@ python scp_loader.py
 python main.py
 ```
 
-`python scp_reader.py` remains available as an alternative way to start the reader. Run `update` from the reader to execute the loader and refresh the in-memory index. The loader retains its existing behavior of reusing JSON files that are already present.
+`python scp_reader.py` remains available as an alternative way to start the reader. Run `update` from the reader to execute the loader and refresh the in-memory index. Its progress updates in place instead of filling the terminal history. The loader retains its existing behavior of reusing JSON files that are already present; run it directly to use the regular `tqdm` progress bars.
 
 ---
 

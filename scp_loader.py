@@ -1,4 +1,8 @@
-import os, re, json, requests
+import argparse
+import json
+import os
+import re
+import requests
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
@@ -25,13 +29,40 @@ def ensure_folder(path):
     os.makedirs(path, exist_ok=True)
 
 
-def run_parallel(items, worker_fn, desc):
-    """Run worker_fn on items using MAX_WORKERS threads and a tqdm progress bar."""
+def emit_progress(desc, completed, total):
+    print(
+        json.dumps(
+            {
+                "event": "progress",
+                "stage": desc,
+                "completed": completed,
+                "total": total,
+            }
+        ),
+        flush=True,
+    )
+
+
+def run_parallel(items, worker_fn, desc, line_progress=False):
+    """Run worker_fn concurrently, with tqdm or line-oriented progress output."""
     results = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(worker_fn, item): item for item in items}
-        for future in tqdm(as_completed(futures), total=len(futures), desc=desc):
+        completed = 0
+        last_percent = -1
+        if line_progress:
+            emit_progress(desc, 0, len(futures))
+            futures_iter = as_completed(futures)
+        else:
+            futures_iter = tqdm(as_completed(futures), total=len(futures), desc=desc)
+        for future in futures_iter:
             results.append(future.result())
+            if line_progress:
+                completed += 1
+                percent = int(completed * 100 / len(futures)) if futures else 100
+                if percent != last_percent:
+                    emit_progress(desc, completed, len(futures))
+                    last_percent = percent
     return results
 
 
@@ -232,7 +263,7 @@ def process_json_file(filepath, subfolder_name, all_slugs, norm_slugs):
     return partial_index
 
 
-def main():
+def main(textual_progress=False):
     ensure_folder(BASE_FOLDER)
     ensure_folder(JSON_FOLDER)
     ensure_folder(HTML_FOLDER)
@@ -243,12 +274,15 @@ def main():
         content_index = requests.get(CONTENT_INDEX_URL, timeout=30).json()
     except Exception as e:
         print(f"Error downloading content index: {e}")
-        return
+        return 1
 
     file_to_key = {v: k for k, v in content_index.items()}
 
     downloaded_paths = run_parallel(
-        list(content_index.values()), download_json_file, "Downloading series"
+        list(content_index.values()),
+        download_json_file,
+        "Downloading series",
+        line_progress=textual_progress,
     )
     json_files = [
         (path, file_to_key.get(os.path.basename(path), "misc"))
@@ -262,6 +296,7 @@ def main():
         json_files,
         lambda item: process_json_file(item[0], item[1], all_slugs, norm_slugs),
         "Processing articles",
+        line_progress=textual_progress,
     )
 
     # Generate the index as soon as the HTML is ready, before downloading images.
@@ -276,12 +311,26 @@ def main():
         print(f"Index generated: {index_path} ({len(index)} entries)")
     except Exception as e:
         print(f"Error saving index: {e}")
+        return 1
 
-    print(f"Downloading images ({len(download_queue)} files)...")
-    run_parallel(list(download_queue), download_image, "Downloading images")
+    print(f"Downloading images ({len(download_queue)} files)...", flush=True)
+    run_parallel(
+        list(download_queue),
+        download_image,
+        "Downloading images",
+        line_progress=textual_progress,
+    )
 
     print("All articles and resources have been processed.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--textual-progress",
+        action="store_true",
+        help="Emit line-oriented JSON progress events for a Textual interface.",
+    )
+    args = parser.parse_args()
+    raise SystemExit(main(textual_progress=args.textual_progress))
