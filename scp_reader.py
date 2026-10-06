@@ -1,6 +1,8 @@
+import asyncio
 import json
 import os
 import re
+import sys
 
 from bs4 import BeautifulSoup
 from textual.app import App, ComposeResult
@@ -21,11 +23,28 @@ HTML_EXPORT_FOLDER = os.path.join("scp_data", "html")
 JSON_FOLDER = os.path.join("scp_data", "json")
 
 
-def html_to_text(html):
+def html_to_text(html, article_slugs=None):
     """Convert article HTML into readable terminal text."""
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style"]):
         tag.decompose()
+
+    article_links = {}
+    for anchor in soup.find_all("a", href=True):
+        match = re.search(
+            r"(?:^|/)(SCP-\d+[\w-]*)(?:\.html)?(?:[?#].*)?$",
+            anchor["href"].strip(),
+            re.IGNORECASE,
+        )
+        if not match:
+            continue
+        slug = match.group(1).upper()
+        if article_slugs is not None and slug not in article_slugs:
+            continue
+        label = anchor.get_text(" ", strip=True) or slug
+        token = f"SCPINTERNALLINK{len(article_links)}END"
+        article_links[token] = (label, slug)
+        anchor.replace_with(token)
 
     for image in soup.find_all("img"):
         alt = image.get("alt", "").strip()
@@ -44,7 +63,12 @@ def html_to_text(html):
             lines.append(line)
         elif lines and lines[-1]:
             lines.append("")
-    return "\n".join(lines).strip()
+    text = "\n".join(lines).strip()
+    text = re.sub(r"([\\`*_{}\[\]()#+\-.!|>])", r"\\\1", text)
+    for token, (label, slug) in article_links.items():
+        escaped_label = re.sub(r"([\\`*_{}\[\]()#+\-.!|>])", r"\\\1", label)
+        text = text.replace(token, f"[{escaped_label}](scp-article:{slug})")
+    return text
 
 
 class CommandInput(Input):
@@ -119,10 +143,10 @@ def series_sort_key(folder):
 
 
 class SCPReader(App):
-    TITLE = "SCP Terminal Reader"
+    TITLE = "SCP Terminal"
     SUB_TITLE = "SCP-OS"
 
-    BINDINGS = [Binding("ctrl+c", "quit", "Quit", show=True)]
+    BINDINGS = [Binding("ctrl+c", "close_active_tab", "Close tab", show=True)]
 
     CSS = """
     Screen {
@@ -182,12 +206,12 @@ class SCPReader(App):
     def on_mount(self):
         if self.index:
             self.write_output(
-                f"Welcome to the SCP Reader. {len(self.index)} articles indexed. "
+                f"Welcome to the SCP. {len(self.index)} articles indexed. "
                 "Type 'help' to get started."
             )
         else:
             self.write_output(
-                "Welcome to the SCP Reader. scp_data/index.json was not found; "
+                "Welcome to the SCP. scp_data/index.json was not found. "
                 "run scp_loader.py first."
             )
         if self.index_error:
@@ -269,7 +293,9 @@ class SCPReader(App):
             if os.path.exists(html_path):
                 try:
                     with open(html_path, encoding="utf-8") as file:
-                        return meta["title"], html_to_text(file.read())
+                        return meta["title"], html_to_text(
+                            file.read(), self.index.keys()
+                        )
                 except OSError as error:
                     self.write_output(f"Error reading {html_path}: {error}")
                     return None
@@ -282,7 +308,7 @@ class SCPReader(App):
                 self.write_output(f"Error reading {meta['json_file']}: {error}")
                 return None
             html = entry.get("raw_content") or entry.get("raw_source", "")
-            return meta["title"], html_to_text(html)
+            return meta["title"], html_to_text(html, self.index.keys())
 
         for root, _, files in os.walk("scp_data"):
             for filename in files:
@@ -313,10 +339,11 @@ class SCPReader(App):
             pane_id = f"article-{len(self.article_pane_ids) + 1}"
             article_view = VerticalScroll(
                 Static(
-                    f"{slug} - {title}\n\n{body}",
+                    f"{slug} - {title}",
                     classes="article-body",
                     markup=False,
                 ),
+                Markdown(body, open_links=False, classes="article-body"),
                 classes="article-scroll",
             )
             await tabs.add_pane(TabPane(title, article_view, id=pane_id))
@@ -347,7 +374,8 @@ class SCPReader(App):
                 "  cls      - clear the terminal history\n"
                 "  help     - show this help\n"
                 "  exit     - quit\n\n"
-                "Use the tabs to switch between the terminal and open articles."
+                "Use the tabs to switch between the terminal and open articles. "
+                "Press Ctrl+C to close an article tab or quit from Terminal."
             )
         elif normalized == "list":
             self.list_scps()

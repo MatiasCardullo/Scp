@@ -4,7 +4,7 @@ A two-part tool for downloading, cataloging, and reading articles from the [Wiki
 
 ```
 📥 scp_loader.py   →  downloads and builds the local archive (JSON + HTML + images)
-🖥️  scp_reader.py   →  retro terminal for searching and reading downloaded articles
+🖥️  main.py         →  retro terminal for searching and reading downloaded articles
 ```
 
 ---
@@ -29,8 +29,8 @@ scp_data/
 └── images/     # Downloaded images
 ```
 
-### `scp_reader.py`
-A Textual TUI with a retro terminal look (dark background, green text, and keyboard navigation) for searching and reading the archive created by `scp_loader.py`.
+### Reader (`main.py` / `scp_reader.py`)
+A Textual TUI with a retro terminal look (dark background, green text, and keyboard navigation) for searching and reading the archive created by `scp_loader.py`. Article references open in reader tabs.
 
 **Available commands:**
 
@@ -42,7 +42,7 @@ A Textual TUI with a retro terminal look (dark background, green text, and keybo
 | `help` | Shows the help message |
 | `exit` / `quit` | Closes the TUI |
 
-The Terminal tab keeps command history and clickable article lists. Opened articles appear in separate tabs; switch back to Terminal without losing its history. Reopening an article selects its existing tab. Images and the original HTML layout are not rendered in the terminal.
+The Terminal tab keeps command history and clickable article lists. Opened articles appear in separate tabs; switch back to Terminal without losing its history. Reopening an article selects its existing tab. Press `Ctrl+C` to close the active article tab; from the Terminal tab, `Ctrl+C` quits the TUI. Images and the original HTML layout are not rendered in the terminal.
 
 ---
 
@@ -59,13 +59,15 @@ pip install -r requirements.txt
 python scp_loader.py
 
 # 2. Start the TUI reader
-python scp_reader.py
+python main.py
 ```
+
+`python scp_reader.py` remains available as an alternative way to start the reader. Run `update` from the reader to execute the loader and refresh the in-memory index. The loader retains its existing behavior of reusing JSON files that are already present.
 
 ---
 
 ## Current notes / limitations
 
 - `scp_loader.py` does not automatically retry network failures; if a download fails, that file is skipped and processing continues.
-- If `scp_data/index.json` is missing, `scp_reader.py` searches for articles by walking the `.json` files under `scp_data/`; searches are direct when the index is available.
-- Internal links between SCPs are created during downloading, not when reading.
+- If `scp_data/index.json` is missing, the reader searches for articles by walking the `.json` files under `scp_data/`; searches are direct when the index is available.
+- The loader stores internal SCP references in article HTML; the reader makes references to locally indexed articles clickable.
