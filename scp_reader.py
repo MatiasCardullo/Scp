@@ -298,19 +298,28 @@ class SCPReader(App):
                         with open(path, encoding="utf-8") as file:
                             data = json.load(file)
                         series = os.path.splitext(filename)[0].removeprefix("content_")
-                        articles.extend(
-                            (
-                                article_id,
-                                entry.get("title") or article_id,
-                                series,
-                                entry.get("link", article_id),
-                            )
-                            for article_id, entry in data.items()
-                            if article_id.startswith("SCP-")
-                        )
+                        for article_id, entry in data.items():
+                            article_series = series
+                            if article_series.casefold() == "scp-001":
+                                if article_id.casefold() != "scp-001":
+                                    continue
+                                article_id = entry.get("scp", article_id)
+                                article_series = entry.get("series", "series-1")
+                            if entry.get("scp") or article_id.startswith("SCP-"):
+                                articles.append(
+                                    (
+                                        article_id,
+                                        entry.get("title") or article_id,
+                                        article_series,
+                                        entry.get("link", article_id),
+                                    )
+                                )
                     except (OSError, json.JSONDecodeError) as error:
                         self.write_output(f"[{filename}] Error: {error}")
 
+        articles = [
+            article for article in articles if article[2].casefold() != "scp-001"
+        ]
         if not articles:
             self.write_output("No SCP articles were found.")
             return
@@ -364,9 +373,10 @@ class SCPReader(App):
     def resolve_article_identity(self, reference):
         if self.index is not None:
             normalized_reference = normalize_article_reference(reference)
-            for identity, metadata in self.index.items():
+            for identity in self.index:
                 if normalize_article_reference(identity) == normalized_reference:
                     return identity
+            for identity, metadata in self.index.items():
                 if metadata.get("scp_id", "").casefold() == reference.casefold():
                     return identity
         return reference.upper()
@@ -398,7 +408,7 @@ class SCPReader(App):
             json_path = os.path.join(JSON_FOLDER, meta["json_file"])
             try:
                 with open(json_path, encoding="utf-8") as file:
-                    entry = json.load(file)[article_id]
+                    entry = json.load(file)[meta.get("json_key", article_id)]
             except (OSError, json.JSONDecodeError, KeyError) as error:
                 self.write_output(f"Error reading {meta['json_file']}: {error}")
                 return None
@@ -467,8 +477,13 @@ class SCPReader(App):
 
     async def on_input_submitted(self, event: Input.Submitted):
         command = event.value.strip()
-        event.input.value = ""
-        event.input.remember(command)
+        await self.execute_command(command, event.input)
+
+    async def execute_command(self, command, command_input=None):
+        if command_input is None:
+            command_input = self.query_one("#command", CommandInput)
+        command_input.value = ""
+        command_input.remember(command)
         if command:
             self.write_output(f"> {command}")
         await self.handle_command(command)
@@ -503,6 +518,10 @@ class SCPReader(App):
             await self.show_scp(command)
         elif command.isdigit() and 1 <= int(command) <= 9999:
             await self.show_scp(f"SCP-{int(command):03}")
+        elif self.index is not None and normalize_article_reference(command) in {
+            normalize_article_reference(identity) for identity in self.index
+        }:
+            await self.show_scp(command)
         elif command:
             self.write_output("Unknown command. Type 'help'.")
 
@@ -598,11 +617,13 @@ class SCPReader(App):
 
     async def on_markdown_link_clicked(self, event: Markdown.LinkClicked):
         if event.href.startswith("scp-article:"):
-            await self.show_scp(
+            await self.execute_command(
                 unquote(event.href.removeprefix("scp-article:"))
             )
         elif event.href.startswith("scp-series:"):
-            self.list_scps(unquote(event.href.removeprefix("scp-series:")))
+            await self.execute_command(
+                f"list {unquote(event.href.removeprefix('scp-series:'))}"
+            )
 
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated):
         if (

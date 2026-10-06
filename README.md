@@ -15,6 +15,7 @@ A two-part tool for downloading, cataloging, and reading articles from the [Wiki
 Downloads the public dataset from [scp-data.tedivm.com](https://scp-data.tedivm.com/) and creates a browsable local archive:
 
 - Downloads the content index and all article `.json` files (organized by series/folder).
+- Refreshes `content_scp-001.json` from the official SCP-001 index page and each proposal linked from it, so that the local archive includes all current proposals.
 - Parses each article's HTML with BeautifulSoup.
 - Uses each record's API `link` value as its local article identity and builds canonical `https://scp-wiki.wikidot.com/` URLs from it; raw downloaded API JSON is left unchanged.
 - Reads complete SCP titles from the official main-series listing pages 1–10, matching articles by their SCP identifier.
@@ -33,6 +34,8 @@ scp_data/
 
 The generated `scp_data/index.json` is keyed by the API `link` values. Each entry also stores the SCP identifier used by reader commands, the resolved title, source JSON filename, and generated HTML filename. Local HTML filenames are derived safely from the API link. The reader continues to accept SCP identifiers such as `SCP-173` or `173`.
 
+SCP-001 pages are read from their rendered Wikidot HTML because the dataset API only includes one proposal. Their records use the same JSON fields as the API articles; unavailable source markup and revision history are left empty.
+
 If a series listing has no title for an article, the loader keeps the API title without reporting each missing title.
 
 ### Reader (`main.py` / `scp_reader.py`)
@@ -50,7 +53,7 @@ A Textual TUI with a retro terminal look (dark background, green text, and keybo
 | `help` | Shows the help message |
 | `exit` / `quit` | Closes the TUI |
 
-The Terminal tab keeps command history and clickable article lists. Opened articles appear in separate tabs; switch back to Terminal without losing its history. Reopening an article selects its existing tab. Press `Ctrl+C` to close the active article tab; from the Terminal tab, `Ctrl+C` quits the TUI. Images and the original HTML layout are not rendered in the terminal.
+The Terminal tab keeps command history and clickable article lists. Clicking a series or article echoes and runs the equivalent command in the terminal (for example, `list joke` or `scp-012`). The SCP-001 index is listed in Series 1; individual proposals remain archived but are omitted from the series overview. Opened articles appear in separate tabs; switch back to Terminal without losing its history. Reopening an article selects its existing tab. Press `Ctrl+C` to close the active article tab; from the Terminal tab, `Ctrl+C` quits the TUI. Images and the original HTML layout are not rendered in the terminal.
 
 ---
 

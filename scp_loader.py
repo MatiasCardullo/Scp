@@ -6,7 +6,7 @@ import requests
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urljoin, urlparse
 from tqdm import tqdm
 
 BASE_FOLDER = "scp_data"
@@ -215,6 +215,136 @@ def extract_series_titles(html):
     return titles
 
 
+def extract_scp_001_proposal_links(html):
+    """Return the proposal page paths listed in the official SCP-001 panel."""
+    soup = BeautifulSoup(html, "html.parser")
+    panels = soup.select("#page-content .content-panel.standalone.series")
+    if not panels:
+        raise ValueError("The official SCP-001 proposal panel was not found")
+
+    links = []
+    seen = set()
+    for panel in panels:
+        for anchor in panel.select("a[href]"):
+            if not anchor.get_text(" ", strip=True).startswith("CODE NAME:"):
+                continue
+            path = urlparse(anchor["href"]).path.strip("/")
+            if not path or path.casefold() in seen:
+                continue
+            seen.add(path.casefold())
+            links.append(path)
+        if links:
+            break
+    if not links:
+        raise ValueError("No proposal links were found on the official SCP-001 page")
+    return links
+
+
+def build_wikidot_article(link, page_html):
+    """Convert an official Wikidot page into the dataset's article record shape."""
+    page_url = wikidot_url(link)
+    soup = BeautifulSoup(page_html, "html.parser")
+    content = soup.select_one("#page-content")
+    if content is None:
+        raise ValueError(f"No article content found at {page_url}")
+
+    title_node = soup.select_one("#page-title")
+    title = title_node.get_text(" ", strip=True) if title_node else link
+    tags_node = soup.select_one(".page-tags")
+    tags = (
+        [tag.get_text(" ", strip=True) for tag in tags_node.select("a")]
+        if tags_node
+        else []
+    )
+    creator = ""
+    licensebox = content.select_one(".licensebox")
+    if licensebox:
+        match = re.search(
+            r"\bby\s+(.+?),\s+from the SCP Wiki",
+            licensebox.get_text(" ", strip=True),
+            re.IGNORECASE,
+        )
+        if match:
+            creator = match.group(1)
+    if not creator:
+        creator_node = content.select_one(".printuser")
+        creator = creator_node.get_text(" ", strip=True) if creator_node else ""
+
+    rating = None
+    rating_node = soup.select_one(".rate-points")
+    if rating_node:
+        rating_match = re.search(r"[-+]?\d+", rating_node.get_text(" ", strip=True))
+        if rating_match:
+            rating = int(rating_match.group())
+
+    images = []
+    for image in content.select("img[src]"):
+        source = urljoin(page_url, image["src"])
+        if source not in images:
+            images.append(source)
+
+    references = list(dict.fromkeys(SCP_MENTION_RE.findall(content.get_text(" "))))
+    for anchor in content.select("a[href]"):
+        match = SCP_HREF_RE.match(anchor["href"].strip())
+        if match:
+            reference = f"SCP-{match.group(1)}"
+            if reference not in references:
+                references.append(reference)
+
+    return {
+        "created_at": None,
+        "creator": creator,
+        "domain": urlparse(page_url).netloc,
+        "history": [],
+        "hubs": [],
+        "images": images,
+        "link": link,
+        "page_id": None,
+        "rating": rating,
+        "raw_content": f"<html><body>{content}</body></html>",
+        "raw_source": "",
+        "references": references,
+        "scp": "SCP-001",
+        "scp_number": 1,
+        "series": "scp-001",
+        "tags": tags,
+        "title": title,
+        "url": page_url,
+    }
+
+
+def update_scp_001_json(textual_progress=False):
+    """Save the official index page and every proposal into the SCP-001 JSON."""
+    index_url = wikidot_url("scp-001")
+    response = requests.get(index_url, timeout=30)
+    response.raise_for_status()
+    proposal_links = extract_scp_001_proposal_links(response.text)
+
+    def fetch_article(link):
+        page_response = requests.get(wikidot_url(link), timeout=30)
+        page_response.raise_for_status()
+        final_link = urlparse(page_response.url).path.strip("/")
+        return final_link, build_wikidot_article(final_link, page_response.text)
+
+    proposal_records = run_parallel(
+        proposal_links,
+        fetch_article,
+        "Downloading SCP-001 proposals",
+        line_progress=textual_progress,
+    )
+    records = {
+        "SCP-001": build_wikidot_article("scp-001", response.text),
+    }
+    records["SCP-001"]["series"] = "series-1"
+    for link, record in proposal_records:
+        records[link] = record
+
+    filepath = os.path.join(JSON_FOLDER, "content_scp-001.json")
+    with open(filepath, "w", encoding="utf-8") as file:
+        json.dump(records, file, ensure_ascii=False)
+    return filepath
+
+
 def fetch_series_titles():
     """Fetch titles from the official main-series listing pages 1 through 10."""
     titles = {}
@@ -254,15 +384,28 @@ def build_article_index(json_files):
                 link = link.strip()
                 filename = link_filename(link)
                 normalized_link = normalize_link(link)
+                article_scp_id = (
+                    entry.get("scp", article_id)
+                    if key.casefold() == "scp-001"
+                    else article_id
+                )
+                article_folder = (
+                    entry.get("series", key)
+                    if key.casefold() == "scp-001"
+                    and article_id.casefold() == "scp-001"
+                    else key
+                )
                 article = {
                     "link": link,
                     "url": wikidot_url(link),
-                    "scp_id": article_id,
-                    "folder": key,
+                    "scp_id": article_scp_id,
+                    "folder": article_folder,
                     "html_file": f"{filename}.html",
                 }
+                if article_id.casefold() != article_scp_id.casefold():
+                    article["json_key"] = article_id
                 articles_by_link[normalized_link] = article
-                links_by_id[article_id.upper()] = article
+                links_by_id[article["scp_id"].upper()] = article
         except (OSError, json.JSONDecodeError) as error:
             tqdm.write(f"Error reading {path}: {error}")
     return articles_by_link, links_by_id
@@ -304,15 +447,18 @@ def process_json_file(
             tqdm.write(f"Skipping {article_id}: API link was not indexed")
             continue
 
-        title = (
-            titles_by_reference.get(normalized_link)
-            or titles_by_reference.get(article_id.upper())
-            or entry.get("title")
-            or article_id
-        )
+        if subfolder_name.casefold() == "scp-001":
+            title = entry.get("title") or article_id
+        else:
+            title = (
+                titles_by_reference.get(normalized_link)
+                or titles_by_reference.get(article_id.upper())
+                or entry.get("title")
+                or article_id
+            )
         html = entry.get("raw_content") or entry.get("raw_source", "")
         soup = BeautifulSoup(html, "html.parser")
-        own_id_upper = article_id.upper()
+        own_id_upper = article.get("scp_id", article_id).upper()
 
         # Remove the "‡ Licensing / Citation" box, which is repeated boilerplate;
         # its collapsible links (javascript:;) do not work here.
@@ -364,7 +510,7 @@ def process_json_file(
                 tag.replace_with(BeautifulSoup(new_html, "html.parser"))
 
         filename = article["html_file"]
-        folder_path = os.path.join(HTML_FOLDER, subfolder_name)
+        folder_path = os.path.join(HTML_FOLDER, article["folder"])
         ensure_folder(folder_path)
         html_path = os.path.join(folder_path, filename)
         try:
@@ -374,15 +520,18 @@ def process_json_file(
             tqdm.write(f"Error saving HTML for {article_id}: {e}")
             continue
 
-        partial_index[link] = {
+        index_entry = {
             "link": link,
             "url": wikidot_url(link),
-            "scp_id": article_id,
+            "scp_id": article.get("scp_id", article_id),
             "title": title,
-            "folder": subfolder_name,
+            "folder": article["folder"],
             "json_file": os.path.basename(filepath),
             "html_file": filename,
         }
+        if article_id.casefold() != index_entry["scp_id"].casefold():
+            index_entry["json_key"] = article_id
+        partial_index[link] = index_entry
 
     return partial_index
 
@@ -408,6 +557,12 @@ def main(textual_progress=False):
         "Downloading series",
         line_progress=textual_progress,
     )
+    try:
+        update_scp_001_json(textual_progress=textual_progress)
+    except (requests.RequestException, ValueError, OSError) as error:
+        print(f"Error downloading SCP-001 proposals: {error}")
+        return 1
+
     json_files = [
         (path, file_to_key.get(os.path.basename(path), "misc"))
         for path in downloaded_paths if path
