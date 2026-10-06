@@ -3,6 +3,7 @@ import json
 import os
 import re
 import sys
+from urllib.parse import quote, unquote, urlparse
 
 from bs4 import BeautifulSoup
 from textual.app import App, ComposeResult
@@ -19,12 +20,38 @@ from textual.widgets import (
     TabbedContent,
 )
 
-INDEX_PATH = os.path.join("scp_data", "index.json")
-HTML_EXPORT_FOLDER = os.path.join("scp_data", "html")
-JSON_FOLDER = os.path.join("scp_data", "json")
+DATA_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scp_data")
+INDEX_PATH = os.path.join(DATA_FOLDER, "index.json")
+HTML_EXPORT_FOLDER = os.path.join(DATA_FOLDER, "html")
+JSON_FOLDER = os.path.join(DATA_FOLDER, "json")
 
 
-def html_to_text(html, article_slugs=None):
+def normalize_article_reference(reference):
+    path = urlparse(reference).path if "://" in reference else reference
+    path = unquote(path).replace("\\", "/").rsplit("/", 1)[-1]
+    if path.lower().endswith(".html"):
+        path = path[:-5]
+    return path.strip("/").casefold()
+
+
+def article_reference_map(index):
+    references = {}
+    for identity, metadata in index.items():
+        references[normalize_article_reference(identity)] = identity
+        if metadata.get("link"):
+            references[normalize_article_reference(metadata["link"])] = identity
+        if metadata.get("url"):
+            references[normalize_article_reference(metadata["url"])] = identity
+        article_id = metadata.get("scp_id")
+        if article_id:
+            references[article_id.casefold()] = identity
+        html_file = metadata.get("html_file")
+        if html_file:
+            references[normalize_article_reference(html_file)] = identity
+    return references
+
+
+def html_to_text(html, article_references=None):
     """Convert article HTML into readable terminal text."""
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style"]):
@@ -32,19 +59,25 @@ def html_to_text(html, article_slugs=None):
 
     article_links = {}
     for anchor in soup.find_all("a", href=True):
+        href = anchor["href"].strip()
+        article_identity = None
         match = re.search(
             r"(?:^|/)(SCP-\d+[\w-]*)(?:\.html)?(?:[?#].*)?$",
-            anchor["href"].strip(),
+            href,
             re.IGNORECASE,
         )
-        if not match:
+        if match:
+            if article_references is None:
+                article_identity = match.group(1).upper()
+            else:
+                article_identity = article_references.get(match.group(1).casefold())
+        if article_identity is None and article_references is not None:
+            article_identity = article_references.get(normalize_article_reference(href))
+        if article_identity is None:
             continue
-        slug = match.group(1).upper()
-        if article_slugs is not None and slug not in article_slugs:
-            continue
-        label = anchor.get_text(" ", strip=True) or slug
+        label = anchor.get_text(" ", strip=True) or article_identity
         token = f"SCPINTERNALLINK{len(article_links)}END"
-        article_links[token] = (label, slug)
+        article_links[token] = (label, article_identity)
         anchor.replace_with(token)
 
     for image in soup.find_all("img"):
@@ -66,9 +99,12 @@ def html_to_text(html, article_slugs=None):
             lines.append("")
     text = "\n".join(lines).strip()
     text = re.sub(r"([\\`*_{}\[\]()#+\-.!|>])", r"\\\1", text)
-    for token, (label, slug) in article_links.items():
+    for token, (label, identity) in article_links.items():
         escaped_label = re.sub(r"([\\`*_{}\[\]()#+\-.!|>])", r"\\\1", label)
-        text = text.replace(token, f"[{escaped_label}](scp-article:{slug})")
+        text = text.replace(
+            token,
+            f"[{escaped_label}](scp-article:{quote(identity, safe=':/_-')})",
+        )
     return text
 
 
@@ -115,12 +151,12 @@ class CommandInput(Input):
         self.cursor_position = len(self.value)
 
 
-def scp_sort_key(slug):
-    match = re.fullmatch(r"SCP-(\d+)(.*)", slug, re.IGNORECASE)
+def scp_sort_key(article_id):
+    match = re.fullmatch(r"SCP-(\d+)(.*)", article_id, re.IGNORECASE)
     if not match:
-        return (1, float("inf"), slug.casefold(), slug.casefold())
+        return (1, float("inf"), article_id.casefold(), article_id.casefold())
     number, suffix = match.groups()
-    return (bool(suffix), int(number), suffix.casefold(), slug.casefold())
+    return (bool(suffix), int(number), suffix.casefold(), article_id.casefold())
 
 
 def series_title(folder):
@@ -211,18 +247,15 @@ class SCPReader(App):
                 )
         yield Footer()
 
-    def on_mount(self):
+    async def on_mount(self):
         self.query_one("#update-status", Static).display = False
         self.query_one("#update-progress", ProgressBar).display = False
-        if self.index:
+        if not os.path.exists(INDEX_PATH):
+            await self.update_archive()
+        elif self.index is not None:
             self.write_output(
                 f"Welcome to the SCP. {len(self.index)} articles indexed. "
                 "Type 'help' to get started."
-            )
-        else:
-            self.write_output(
-                "Welcome to the SCP. scp_data/index.json was not found. "
-                "run scp_loader.py first."
             )
         if self.index_error:
             self.write_output(f"[index.json] Error: {self.index_error}")
@@ -243,15 +276,20 @@ class SCPReader(App):
         output.mount(Static(text, markup=False))
         output.scroll_end(animate=False)
 
-    def list_scps(self):
+    def list_scps(self, requested_series=None):
         if self.index is not None:
             articles = [
-                (slug, entry.get("title") or slug, entry.get("folder", "misc"))
-                for slug, entry in self.index.items()
+                (
+                    entry.get("scp_id", identity),
+                    entry.get("title") or entry.get("scp_id", identity),
+                    entry.get("folder", "misc"),
+                    identity,
+                )
+                for identity, entry in self.index.items()
             ]
         else:
             articles = []
-            for root, _, files in os.walk("scp_data"):
+            for root, _, files in os.walk(DATA_FOLDER):
                 for filename in files:
                     if not filename.endswith(".json"):
                         continue
@@ -261,9 +299,14 @@ class SCPReader(App):
                             data = json.load(file)
                         series = os.path.splitext(filename)[0].removeprefix("content_")
                         articles.extend(
-                            (slug, entry.get("title") or slug, series)
-                            for slug, entry in data.items()
-                            if slug.startswith("SCP-")
+                            (
+                                article_id,
+                                entry.get("title") or article_id,
+                                series,
+                                entry.get("link", article_id),
+                            )
+                            for article_id, entry in data.items()
+                            if article_id.startswith("SCP-")
                         )
                     except (OSError, json.JSONDecodeError) as error:
                         self.write_output(f"[{filename}] Error: {error}")
@@ -273,38 +316,80 @@ class SCPReader(App):
             return
         articles.sort(key=lambda article: scp_sort_key(article[0]))
         grouped_articles = {}
-        for slug, title, series in articles:
-            grouped_articles.setdefault(series, []).append((slug, title))
+        for article_id, title, series, identity in articles:
+            grouped_articles.setdefault(series, []).append((article_id, title, identity))
 
         output = self.query_one("#output", VerticalScroll)
-        for series in sorted(grouped_articles, key=series_sort_key):
-            links = []
-            for slug, title in grouped_articles[series]:
-                label = title.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
-                links.append(f"[{label}](scp-article:{slug})")
-            article_lines = [
-                "  ".join(links[start:start + 10])
-                for start in range(0, len(links), 10)
+        ordered_series = sorted(grouped_articles, key=series_sort_key)
+        if requested_series is None:
+            series_lines = [
+                f"- [{series_title(series)} ({len(grouped_articles[series])} articles)]"
+                f"(scp-series:{quote(series, safe=':/_-')})"
+                for series in ordered_series
             ]
-            markdown = f"## {series_title(series)}\n\n" + "  \n".join(article_lines)
-            output.mount(Markdown(markdown, open_links=False))
+            output.mount(Markdown("\n".join(series_lines), open_links=False))
+            output.scroll_end(animate=False)
+            return
+
+        requested_key = requested_series.casefold()
+        series = next(
+            (
+                candidate
+                for candidate in ordered_series
+                if candidate.casefold() == requested_key
+                or series_title(candidate).casefold() == requested_key
+            ),
+            None,
+        )
+        if series is None:
+            self.write_output(
+                f"Series '{requested_series}' not found. Type 'list' to see available series."
+            )
+            return
+
+        article_lines = []
+        for article_id, title, identity in grouped_articles[series]:
+            label = title.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+            article_lines.append(
+                f"- {article_id} - "
+                f"[{label}](scp-article:{quote(identity, safe=':/_-')})"
+            )
+        markdown = (
+            f"## {series_title(series)} ({len(article_lines)} articles)\n\n"
+            + "\n".join(article_lines)
+        )
+        output.mount(Markdown(markdown, open_links=False))
         output.scroll_end(animate=False)
 
-    def find_article(self, slug):
-        slug = slug.upper()
+    def resolve_article_identity(self, reference):
         if self.index is not None:
-            meta = self.index.get(slug)
+            normalized_reference = normalize_article_reference(reference)
+            for identity, metadata in self.index.items():
+                if normalize_article_reference(identity) == normalized_reference:
+                    return identity
+                if metadata.get("scp_id", "").casefold() == reference.casefold():
+                    return identity
+        return reference.upper()
+
+    def find_article(self, reference):
+        identity = self.resolve_article_identity(reference)
+        article_id = identity
+        if self.index is not None:
+            meta = self.index.get(identity)
             if not meta:
                 return None
+            article_id = meta.get("scp_id", identity)
 
             html_path = os.path.join(
-                HTML_EXPORT_FOLDER, meta["folder"], f"{slug}.html"
+                HTML_EXPORT_FOLDER,
+                meta["folder"],
+                meta.get("html_file", f"{identity}.html"),
             )
             if os.path.exists(html_path):
                 try:
                     with open(html_path, encoding="utf-8") as file:
                         return meta["title"], html_to_text(
-                            file.read(), self.index.keys()
+                            file.read(), article_reference_map(self.index)
                         )
                 except OSError as error:
                     self.write_output(f"Error reading {html_path}: {error}")
@@ -313,14 +398,17 @@ class SCPReader(App):
             json_path = os.path.join(JSON_FOLDER, meta["json_file"])
             try:
                 with open(json_path, encoding="utf-8") as file:
-                    entry = json.load(file)[slug]
+                    entry = json.load(file)[article_id]
             except (OSError, json.JSONDecodeError, KeyError) as error:
                 self.write_output(f"Error reading {meta['json_file']}: {error}")
                 return None
             html = entry.get("raw_content") or entry.get("raw_source", "")
-            return meta["title"], html_to_text(html, self.index.keys())
+            return meta["title"], html_to_text(
+                html, article_reference_map(self.index)
+            )
 
-        for root, _, files in os.walk("scp_data"):
+        article_id = identity
+        for root, _, files in os.walk(DATA_FOLDER):
             for filename in files:
                 if not filename.endswith(".json"):
                     continue
@@ -328,28 +416,44 @@ class SCPReader(App):
                 try:
                     with open(path, encoding="utf-8") as file:
                         data = json.load(file)
-                    if slug in data:
-                        entry = data[slug]
+                    article_match = next(
+                        (
+                            (article_id, value)
+                            for article_id, value in data.items()
+                            if article_id.casefold() == identity.casefold()
+                            or value.get("link", "").casefold()
+                            == reference.casefold()
+                        ),
+                        None,
+                    )
+                    if article_match is not None:
+                        article_id, entry = article_match
                         html = entry.get("raw_content") or entry.get("raw_source", "")
-                        return entry.get("title", slug), html_to_text(html)
+                        title = entry.get("title") or entry.get("link") or article_id
+                        return title, html_to_text(html)
                 except (OSError, json.JSONDecodeError) as error:
                     self.write_output(f"[{filename}] Error: {error}")
         return None
 
-    async def show_scp(self, slug):
-        slug = slug.upper()
-        article = self.find_article(slug)
+    async def show_scp(self, reference):
+        identity = self.resolve_article_identity(reference)
+        article = self.find_article(identity)
         if article is None:
             self.write_output("SCP article not found.")
             return
         title, body = article
         tabs = self.query_one("#workspace-tabs", TabbedContent)
-        pane_id = self.article_pane_ids.get(slug)
+        pane_id = self.article_pane_ids.get(identity)
         if pane_id is None:
             pane_id = f"article-{len(self.article_pane_ids) + 1}"
+            article_id = (
+                self.index.get(identity, {}).get("scp_id", identity)
+                if self.index is not None
+                else identity
+            )
             article_view = VerticalScroll(
                 Static(
-                    f"{slug} - {title}",
+                    f"{article_id} - {title}",
                     classes="article-body",
                     markup=False,
                 ),
@@ -357,7 +461,7 @@ class SCPReader(App):
                 classes="article-scroll",
             )
             await tabs.add_pane(TabPane(title, article_view, id=pane_id))
-            self.article_pane_ids[slug] = pane_id
+            self.article_pane_ids[identity] = pane_id
         self.set_focus(None)
         tabs.active = pane_id
 
@@ -380,7 +484,8 @@ class SCPReader(App):
                 "Commands:\n"
                 "  SCP-###  - open an article\n"
                 "  ###      - open an article by number\n"
-                "  list     - show series and clickable article titles\n"
+                "  list     - show series titles and article counts\n"
+                "  list <series> - show article IDs and titles in a series\n"
                 "  update   - run the loader and refresh the archive index\n"
                 "  cls      - clear the terminal history\n"
                 "  help     - show this help\n"
@@ -390,6 +495,8 @@ class SCPReader(App):
             )
         elif normalized == "list":
             self.list_scps()
+        elif normalized.startswith("list "):
+            self.list_scps(command[5:].strip())
         elif normalized == "update":
             await self.update_archive()
         elif command.upper().startswith("SCP-"):
@@ -483,15 +590,19 @@ class SCPReader(App):
             return
 
         await tabs.remove_pane(pane_id)
-        for slug, article_pane_id in list(self.article_pane_ids.items()):
+        for identity, article_pane_id in list(self.article_pane_ids.items()):
             if article_pane_id == pane_id:
-                del self.article_pane_ids[slug]
+                del self.article_pane_ids[identity]
                 break
         self.query_one("#command", CommandInput).focus()
 
     async def on_markdown_link_clicked(self, event: Markdown.LinkClicked):
         if event.href.startswith("scp-article:"):
-            await self.show_scp(event.href.removeprefix("scp-article:"))
+            await self.show_scp(
+                unquote(event.href.removeprefix("scp-article:"))
+            )
+        elif event.href.startswith("scp-series:"):
+            self.list_scps(unquote(event.href.removeprefix("scp-series:")))
 
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated):
         if (

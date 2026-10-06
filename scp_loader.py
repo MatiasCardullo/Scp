@@ -6,7 +6,7 @@ import requests
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from tqdm import tqdm
 
 BASE_FOLDER = "scp_data"
@@ -15,6 +15,9 @@ HTML_FOLDER = os.path.join(BASE_FOLDER, "html")
 IMG_FOLDER = os.path.join(BASE_FOLDER, "images")
 BASE_JSON_URL = "https://scp-data.tedivm.com/data/scp/items/"
 CONTENT_INDEX_URL = BASE_JSON_URL + "content_index.json"
+WIKIDOT_BASE_URL = "https://scp-wiki.wikidot.com/"
+SCP_ID_RE = re.compile(r"^SCP-\d+[\w-]*$", re.IGNORECASE)
+SERIES_LINK_RE = re.compile(r"^/?(SCP-\d+[\w-]*)$", re.IGNORECASE)
 
 MAX_WORKERS = 4  # Number of files processed/downloaded concurrently.
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
@@ -151,27 +154,126 @@ def resolve_image_url(img, url_map):
     return real_url
 
 
-def build_slug_index(json_files):
-    """all_slugs maps each slug (with its original dataset casing) to its
-    folder/series. norm_slugs maps uppercase slugs to their original casing so
-    mentions can be matched regardless of their capitalization."""
-    all_slugs = {}
+def normalize_link(link):
+    """Return a case-insensitive Wikidot page path for comparing API links."""
+    path = urlparse(link).path if "://" in link else link
+    return path.strip().strip("/").casefold()
+
+
+def link_filename(link):
+    """Build a Windows-safe local filename from the API's Wikidot link."""
+    path = urlparse(link).path if "://" in link else link
+    path = path.strip("/")
+    return quote(path, safe="-_.")
+
+
+def wikidot_url(link):
+    """Build the canonical SCP Wiki URL for a relative API link."""
+    path = urlparse(link).path if "://" in link else link
+    return WIKIDOT_BASE_URL + path.lstrip("/")
+
+
+def extract_series_titles(html):
+    """Extract titles indexed by both listing URL paths and visible SCP IDs."""
+    soup = BeautifulSoup(html, "html.parser")
+    titles = {}
+    for anchor in soup.select("#page-content a[href]"):
+        item = anchor.find_parent("li")
+        if item is None:
+            continue
+        path = urlparse(anchor["href"]).path
+        path_match = SERIES_LINK_RE.fullmatch(path)
+        anchor_text = anchor.get_text(" ", strip=True)
+        article_id = anchor_text.upper()
+        if re.fullmatch(r"/scp-series(?:-\d+)?", path, re.IGNORECASE):
+            continue
+        if not path_match and not SCP_ID_RE.fullmatch(article_id):
+            continue
+
+        item_text = item.get_text(" ", strip=True)
+        if item_text == anchor_text:
+            if SCP_ID_RE.fullmatch(article_id):
+                continue
+            title = anchor_text
+        elif item_text.startswith(anchor_text):
+            title = re.sub(
+                r"^\s*[-–—]\s*",
+                "",
+                item_text[len(anchor_text):],
+                count=1,
+            ).strip()
+            if not title and not SCP_ID_RE.fullmatch(article_id):
+                title = anchor_text
+        else:
+            continue
+        if title:
+            if path_match:
+                titles[normalize_link(path)] = title
+                titles[path_match.group(1).upper()] = title
+            elif SCP_ID_RE.fullmatch(article_id):
+                titles[article_id] = title
+    return titles
+
+
+def fetch_series_titles():
+    """Fetch titles from the official main-series listing pages 1 through 10."""
+    titles = {}
+    for series_number in range(1, 11):
+        url = f"{WIKIDOT_BASE_URL}scp-series-{series_number}"
+        try:
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+        except requests.RequestException as error:
+            tqdm.write(f"Error downloading series {series_number} titles: {error}")
+            continue
+
+        series_titles = extract_series_titles(response.text)
+        if not series_titles:
+            tqdm.write(f"No article titles found on {response.url}")
+            continue
+        titles.update(series_titles)
+    return titles
+
+
+def build_article_index(json_files):
+    """Map API links to article metadata and SCP identifiers to API links."""
+    articles_by_link = {}
+    links_by_id = {}
     for path, key in json_files:
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
-            for slug in data.keys():
-                all_slugs[slug] = key
-        except Exception:
-            pass
-    norm_slugs = {s.upper(): s for s in all_slugs}
-    return all_slugs, norm_slugs
+            for article_id, entry in data.items():
+                link = entry.get("link")
+                if not isinstance(link, str) or not link.strip():
+                    tqdm.write(
+                        f"Skipping {article_id} in {os.path.basename(path)}: "
+                        "missing API link"
+                    )
+                    continue
+                link = link.strip()
+                filename = link_filename(link)
+                normalized_link = normalize_link(link)
+                article = {
+                    "link": link,
+                    "url": wikidot_url(link),
+                    "scp_id": article_id,
+                    "folder": key,
+                    "html_file": f"{filename}.html",
+                }
+                articles_by_link[normalized_link] = article
+                links_by_id[article_id.upper()] = article
+        except (OSError, json.JSONDecodeError) as error:
+            tqdm.write(f"Error reading {path}: {error}")
+    return articles_by_link, links_by_id
 
 
-def process_json_file(filepath, subfolder_name, all_slugs, norm_slugs):
+def process_json_file(
+    filepath, subfolder_name, articles_by_link, links_by_id, titles_by_reference
+):
     """Process a series JSON file: generate HTML for each article (with links
     between SCPs, local images, and no self-references) and return its partial
-    index in the form {slug: {title, folder, json_file}}."""
+    index keyed by API link."""
     partial_index = {}
     try:
         with open(filepath, encoding="utf-8") as f:
@@ -180,20 +282,37 @@ def process_json_file(filepath, subfolder_name, all_slugs, norm_slugs):
         tqdm.write(f"Error reading {filepath}: {e}")
         return partial_index
 
-    def find_slug_location(mention):
-        """Given a mention as it appears in the text (e.g. 'SCP-999'), return
-        (real_slug, relative_path), or (None, None) if it is not available locally."""
-        real_slug = norm_slugs.get(mention.upper())
-        if not real_slug:
+    def find_article_location(mention):
+        """Return a linked article and its relative HTML path for a local SCP ID."""
+        article = links_by_id.get(mention.upper())
+        if not article:
             return None, None
-        folder = all_slugs.get(real_slug)
-        return real_slug, f"{folder}/{real_slug}.html"
+        return article, f"{article['folder']}/{article['html_file']}"
 
-    for slug, entry in data.items():
-        title = entry.get("title", slug)
+    for article_id, entry in data.items():
+        link = entry.get("link")
+        if not isinstance(link, str) or not link.strip():
+            tqdm.write(
+                f"Skipping {article_id} in {os.path.basename(filepath)}: "
+                "missing API link"
+            )
+            continue
+        link = link.strip()
+        normalized_link = normalize_link(link)
+        article = articles_by_link.get(normalized_link)
+        if article is None:
+            tqdm.write(f"Skipping {article_id}: API link was not indexed")
+            continue
+
+        title = (
+            titles_by_reference.get(normalized_link)
+            or titles_by_reference.get(article_id.upper())
+            or entry.get("title")
+            or article_id
+        )
         html = entry.get("raw_content") or entry.get("raw_source", "")
         soup = BeautifulSoup(html, "html.parser")
-        own_slug_upper = slug.upper()
+        own_id_upper = article_id.upper()
 
         # Remove the "‡ Licensing / Citation" box, which is repeated boilerplate;
         # its collapsible links (javascript:;) do not work here.
@@ -207,31 +326,31 @@ def process_json_file(filepath, subfolder_name, all_slugs, norm_slugs):
             if real_url:
                 img["src"] = enqueue_image(real_url)
 
-        # --- links ya existentes hacia otros SCP (<a href="/scp-025">) ---
+        # --- Existing links to other SCPs. ---
         for a in soup.find_all("a", href=True):
             m = SCP_HREF_RE.match(a["href"].strip())
             if not m:
                 continue
             mention = f"SCP-{m.group(1)}"
-            if mention.upper() == own_slug_upper:
+            if mention.upper() == own_id_upper:
                 # Self-reference (e.g. citation box): plain, non-clickable text.
                 a.replace_with(a.get_text())
                 continue
-            real_slug, rel_path = find_slug_location(mention)
-            if real_slug:
+            target_article, rel_path = find_article_location(mention)
+            if target_article:
                 a["href"] = f"../{rel_path}"
             else:
                 # Not available locally: keep it as a real external link.
-                a["href"] = f"https://scpwiki.com{a['href']}"
+                a["href"] = wikidot_url(a["href"])
 
         # --- Standalone mentions in plain text (never wrapped in an <a>). ---
         def link_scp_refs(text):
             def sub(m):
                 mention = m.group(1)
-                if mention.upper() == own_slug_upper:
+                if mention.upper() == own_id_upper:
                     return mention
-                real_slug, rel_path = find_slug_location(mention)
-                if real_slug:
+                target_article, rel_path = find_article_location(mention)
+                if target_article:
                     return f'<a href="../{rel_path}">{mention}</a>'
                 return mention
             return SCP_MENTION_RE.sub(sub, text)
@@ -244,20 +363,25 @@ def process_json_file(filepath, subfolder_name, all_slugs, norm_slugs):
                 # Parse as a fragment, not plain text, or the <a> will be escaped.
                 tag.replace_with(BeautifulSoup(new_html, "html.parser"))
 
+        filename = article["html_file"]
         folder_path = os.path.join(HTML_FOLDER, subfolder_name)
         ensure_folder(folder_path)
-        html_path = os.path.join(folder_path, f"{slug}.html")
+        html_path = os.path.join(folder_path, filename)
         try:
             with open(html_path, "w", encoding="utf-8") as f:
                 f.write(str(soup))
         except Exception as e:
-            tqdm.write(f"Error saving HTML for {slug}: {e}")
+            tqdm.write(f"Error saving HTML for {article_id}: {e}")
             continue
 
-        partial_index[slug] = {
+        partial_index[link] = {
+            "link": link,
+            "url": wikidot_url(link),
+            "scp_id": article_id,
             "title": title,
             "folder": subfolder_name,
             "json_file": os.path.basename(filepath),
+            "html_file": filename,
         }
 
     return partial_index
@@ -289,12 +413,15 @@ def main(textual_progress=False):
         for path in downloaded_paths if path
     ]
 
-    all_slugs, norm_slugs = build_slug_index(json_files)
-    print(f"Found {len(all_slugs)} slugs. Processing articles...")
+    articles_by_link, links_by_id = build_article_index(json_files)
+    print(f"Found {len(articles_by_link)} API links. Loading official SCP titles...")
+    titles_by_reference = fetch_series_titles()
 
     partial_indexes = run_parallel(
         json_files,
-        lambda item: process_json_file(item[0], item[1], all_slugs, norm_slugs),
+        lambda item: process_json_file(
+            item[0], item[1], articles_by_link, links_by_id, titles_by_reference
+        ),
         "Processing articles",
         line_progress=textual_progress,
     )
