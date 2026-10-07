@@ -1,11 +1,11 @@
-# Local data: `scp_data/`
+# Local data: `data/`
 
-`scp_data/` is the local archive produced and used by the application. It
+`data/` is the local archive produced and used by the application. It
 contains source data, HTML prepared for the reader, a navigation index, and
 optionally downloaded images.
 
 ```text
-scp_data/
+data/
 ├── index.json
 ├── update.log
 ├── json/

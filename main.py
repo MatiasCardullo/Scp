@@ -1,4 +1,4 @@
-from scp_reader import SCPReader
+from reader import SCPReader
 
 
 if __name__ == "__main__":

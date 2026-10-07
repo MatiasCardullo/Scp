@@ -3,23 +3,23 @@
 A local SCP archive browser for downloading, cataloging, searching, and reading articles from the [SCP Wiki](https://scp-wiki.wikidot.com/) through one retro terminal-style application.
 
 ```
-🖥️  main.py              →  starts the application; browse, read, and update the archive here
-📥 scp_reader.py         →  implements the terminal interface and reader behavior
-⚙️  scp_loader.py        →  downloads and builds the local archive (JSON + HTML + images)
-🔄 scp_loader_worker.py  →  runs archive updates separately to keep the interface responsive
+🖥️  main.py         →  starts the application; browse, read, and update the archive here
+📥 reader.py        →  implements the terminal interface and reader behavior
+⚙️  loader.py       →  downloads and builds the local archive (JSON + HTML + images)
+🔄 workers.py       →  runs archive updates separately to keep the interface responsive
 ```
 
 ## Documentation
 
 - [Project scripts](docs/scripts.md)
 - [API JSON files](docs/api-json.md)
-- [Local data in `scp_data/`](docs/scp-data.md)
+- [Local data in `data/`](docs/scp-data.md)
 
 ---
 
 ## What each script does
 
-### `scp_loader.py`
+### `loader.py`
 Downloads the public dataset from [scp-data.tedivm.com](https://scp-data.tedivm.com/) and creates a browsable local archive:
 
 - Downloads the content index and all article `.json` files (organized by series/folder).
@@ -29,10 +29,10 @@ Downloads the public dataset from [scp-data.tedivm.com](https://scp-data.tedivm.
 - Reads complete SCP titles from the official main-series listing pages 1–10, matching articles by their SCP identifier.
 - Replaces `SCP-###` references with internal links to the corresponding article.
 - With `--media`, downloads referenced images in parallel (4 workers) and saves them locally, updating their `src` attributes. Image downloads are skipped by default.
-- Saves everything under `scp_data/` using this structure:
+- Saves everything under `data/` using this structure:
 
 ```
-scp_data/
+data/
 ├── json/       # Original downloaded JSON files
 ├── html/       # Processed HTML, organized by series
 │   └── series-1/
@@ -40,15 +40,15 @@ scp_data/
 └── images/     # Downloaded images
 ```
 
-The generated `scp_data/index.json` is keyed by the API `link` values. Each entry also stores the SCP identifier used by reader commands, the resolved title, source JSON filename, and generated HTML filename. Local HTML filenames are derived safely from the API link. The reader continues to accept SCP identifiers such as `SCP-173` or `173`.
+The generated `data/index.json` is keyed by the API `link` values. Each entry also stores the SCP identifier used by reader commands, the resolved title, source JSON filename, and generated HTML filename. Local HTML filenames are derived safely from the API link. The reader continues to accept SCP identifiers such as `SCP-173` or `173`.
 
-The loader exposes `update_archive(download_media=False)` for import-based use. The reader starts `scp_loader_worker.py` as a subprocess; the worker imports this function so updates remain isolated from the UI while streaming progress.
+The loader exposes `update_archive(download_media=False)` for import-based use. The reader starts `workers.py` as a subprocess; the worker imports this function so updates remain isolated from the UI while streaming progress.
 
 SCP-001 pages are read from their rendered Wikidot HTML so the local archive can include every proposal linked from the official index. Their records use the same JSON fields as the API articles; unavailable source markup and revision history are left empty.
 
 If a series listing has no title for an article, the loader keeps the API title without reporting each missing title.
 
-### Reader (`main.py` / `scp_reader.py`)
+### Reader (`main.py` / `reader.py`)
 A Textual TUI with a retro terminal look (dark background, green text, and keyboard navigation) for searching and reading the archive created by `scp_loader.py`. Article references open in reader tabs.
 
 **Available commands:**
@@ -83,12 +83,12 @@ pip install -r requirements.txt
 python main.py
 ```
 
-Run the loader directly with `python scp_loader.py --media` to include image downloads.
+Run the loader directly with `python loader.py --media` to include image downloads.
 
 ---
 
 ## Current notes / limitations
 
-- Image downloads are opt-in with `update --media` (or `python scp_loader.py --media`); they retry temporary network, rate-limit, and server errors, and permanently unavailable images are logged and retried on a later media update.
-- If `scp_data/index.json` is missing, the reader automatically runs the loader when it starts.
+- Image downloads are opt-in with `update --media` (or `python loader.py --media`); they retry temporary network, rate-limit, and server errors, and permanently unavailable images are logged and retried on a later media update.
+- If `data/index.json` is missing, the reader automatically runs the loader when it starts.
 - The loader stores internal SCP references in article HTML; the reader makes references to locally indexed articles clickable.

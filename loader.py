@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from urllib.parse import quote, urljoin, urlparse
 
-BASE_FOLDER = "scp_data"
+BASE_FOLDER = "data"
 JSON_FOLDER = os.path.join(BASE_FOLDER, "json")
 HTML_FOLDER = os.path.join(BASE_FOLDER, "html")
 IMG_FOLDER = os.path.join(BASE_FOLDER, "images")

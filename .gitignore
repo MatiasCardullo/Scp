@@ -1,4 +1,4 @@
-/scp_data
+/data
 .vscode/settings.json
 *.pyc
 docs/foundation-context.md

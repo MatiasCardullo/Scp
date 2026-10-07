@@ -1,6 +1,6 @@
 import argparse
 
-from scp_loader import update_archive
+from loader import update_archive
 
 
 def run_worker(download_media=False):

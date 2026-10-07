@@ -11,7 +11,7 @@ import requests
 from textual.containers import VerticalScroll
 from textual.widgets import Collapsible, Input, Markdown, OptionList, TabbedContent
 
-from scp_loader import (
+from loader import (
     BASE_JSON_URL,
     CONTENT_INDEX_URL,
     build_article_index,
@@ -29,7 +29,7 @@ from scp_loader import (
     main as run_loader,
     wikidot_url,
 )
-from scp_reader import (
+from reader import (
     CommandInput,
     SCPReader,
     CollapsibleSection,

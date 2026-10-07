@@ -3,14 +3,14 @@
 ## `main.py`
 
 This is the application entry point. It creates and runs `SCPReader` from
-`scp_reader.py`; the reader's interface and behavior are implemented in that
+`reader.py`; the reader's interface and behavior are implemented in that
 module.
 
 ```powershell
 python main.py
 ```
 
-## `scp_loader.py`
+## `loader.py`
 
 Downloads and prepares the local archive:
 
@@ -20,7 +20,7 @@ Downloads and prepares the local archive:
 2. Downloads the series and special-group JSON files. It compares them with
    existing files and avoids reprocessing unchanged content.
 3. Fetches the official series pages to fill in article titles.
-4. Builds `scp_data/index.json` and generates a local HTML file for each
+4. Builds `data/index.json` and generates a local HTML file for each
    article from `raw_content` (or `raw_source` if `raw_content` is missing).
    The generated HTML links to other articles available locally.
 5. Rebuilds the SCP-001 records from the official index and its linked
@@ -33,11 +33,11 @@ It also exposes `update_archive(download_media=False)` for use by other
 modules. When run directly, it supports:
 
 ```powershell
-python scp_loader.py
-python scp_loader.py --media
+python loader.py
+python loader.py --media
 ```
 
-## `scp_loader_worker.py`
+## `workers.py`
 
 This small wrapper runs `update_archive` in a process separate from the
 reader. It accepts `--media` and propagates the loader's exit code. The reader
@@ -47,13 +47,13 @@ updates; the loader emits progress events for the interface to display.
 It can also be run directly:
 
 ```powershell
-python scp_loader_worker.py
-python scp_loader_worker.py --media
+python workers.py
+python workers.py --media
 ```
 
-## `scp_reader.py`
+## `reader.py`
 
-Implements the Textual-based TUI. It reads `scp_data/index.json` to resolve
+Implements the Textual-based TUI. It reads `data/index.json` to resolve
 articles, then loads the processed HTML. If the HTML is unavailable, it tries
 to read the content from the source JSON. It can open articles, list series,
 navigate tabs, and update the archive using the worker.

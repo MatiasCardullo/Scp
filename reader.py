@@ -26,7 +26,7 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option
 
-DATA_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scp_data")
+DATA_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 INDEX_PATH = os.path.join(DATA_FOLDER, "index.json")
 UPDATE_LOG_PATH = os.path.join(DATA_FOLDER, "update.log")
 HTML_EXPORT_FOLDER = os.path.join(DATA_FOLDER, "html")
@@ -880,7 +880,7 @@ class SCPReader(App):
             self.update_worker = None
 
     async def update_archive(self, download_media=False):
-        worker_path = os.path.join(os.path.dirname(__file__), "scp_loader_worker.py")
+        worker_path = os.path.join(os.path.dirname(__file__), "workers.py")
         self.write_output("Starting SCP archive update...")
         log_file = None
         try:
@@ -926,7 +926,7 @@ class SCPReader(App):
                 stderr=asyncio.subprocess.STDOUT,
             )
         except OSError as error:
-            message = f"Could not start scp_loader_worker.py: {error}"
+            message = f"Could not start workers.py: {error}"
             self.write_output(message)
             log_line(message)
             if log_file is not None:
