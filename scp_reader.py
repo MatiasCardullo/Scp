@@ -3,12 +3,13 @@ import json
 import os
 import re
 import sys
+from datetime import datetime
 from urllib.parse import quote, unquote, urlparse
 
 from bs4 import BeautifulSoup
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import (
     Footer,
@@ -25,6 +26,7 @@ from textual.widgets.option_list import Option
 
 DATA_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scp_data")
 INDEX_PATH = os.path.join(DATA_FOLDER, "index.json")
+UPDATE_LOG_PATH = os.path.join(DATA_FOLDER, "update.log")
 HTML_EXPORT_FOLDER = os.path.join(DATA_FOLDER, "html")
 JSON_FOLDER = os.path.join(DATA_FOLDER, "json")
 
@@ -265,6 +267,31 @@ class SCPReader(App):
     #terminal-tab {
         height: 1fr;
     }
+    #update-panel {
+        height: 2;
+        width: 1fr;
+        margin: 0 1;
+        padding: 0 1;
+    }
+    .update-row {
+        height: 1;
+        layout: horizontal;
+    }
+    .update-status {
+        width: auto;
+        height: 1;
+    }
+    .update-progress {
+        width: 1fr;
+        height: 1;
+        margin-left: 1;
+    }
+    .process-article-id {
+        width: auto;
+        max-width: 24;
+        height: 1;
+        margin-left: 1;
+    }
     .article-scroll {
         height: 1fr;
         border: round #1f7a1f;
@@ -291,13 +318,38 @@ class SCPReader(App):
         with TabbedContent(id="workspace-tabs"):
             with TabPane("Terminal", id="terminal-tab"):
                 yield VerticalScroll(id="output")
-                yield Static(id="update-status")
-                yield ProgressBar(
-                    total=100,
-                    show_eta=False,
-                    show_percentage=True,
-                    id="update-progress",
-                )
+                with Vertical(id="update-panel"):
+                    with Horizontal(classes="update-row"):
+                        yield Static(
+                            "Downloading series",
+                            id="download-status",
+                            classes="update-status",
+                        )
+                        yield ProgressBar(
+                            total=100,
+                            show_eta=False,
+                            show_percentage=True,
+                            id="download-progress",
+                            classes="update-progress",
+                        )
+                    with Horizontal(classes="update-row"):
+                        yield Static(
+                            "Processing articles",
+                            id="process-status",
+                            classes="update-status",
+                        )
+                        yield ProgressBar(
+                            total=100,
+                            show_eta=False,
+                            show_percentage=True,
+                            id="process-progress",
+                            classes="update-progress",
+                        )
+                        yield Static(
+                            "",
+                            id="process-article-id",
+                            classes="process-article-id",
+                        )
                 yield CommandInput(
                     placeholder="Type help to see available commands",
                     id="command",
@@ -305,8 +357,7 @@ class SCPReader(App):
         yield Footer()
 
     async def on_mount(self):
-        self.query_one("#update-status", Static).display = False
-        self.query_one("#update-progress", ProgressBar).display = False
+        self.query_one("#update-panel", Vertical).display = False
         if not os.path.exists(INDEX_PATH):
             self.write_output(
                 "Welcome to the SCP. Type 'help' to get started."
@@ -675,63 +726,118 @@ class SCPReader(App):
     async def update_archive(self):
         loader_path = os.path.join(os.path.dirname(__file__), "scp_loader.py")
         self.write_output("Starting SCP archive update...")
-        status = self.query_one("#update-status", Static)
-        progress = self.query_one("#update-progress", ProgressBar)
-        status.display = True
-        progress.display = True
-        status.update("Starting loader...")
-        progress.update(progress=0)
+        log_file = None
+        try:
+            os.makedirs(os.path.dirname(UPDATE_LOG_PATH), exist_ok=True)
+            log_file = open(UPDATE_LOG_PATH, "w", encoding="utf-8")
+        except OSError as error:
+            self.write_output(f"Could not open update log {UPDATE_LOG_PATH}: {error}")
+
+        def log_line(line):
+            nonlocal log_file
+            if log_file is None:
+                return
+            try:
+                log_file.write(line + "\n")
+                log_file.flush()
+            except OSError as error:
+                log_file.close()
+                log_file = None
+                self.write_output(f"Could not write update log {UPDATE_LOG_PATH}: {error}")
+
+        log_line(f"\n[{datetime.now().astimezone().isoformat(timespec='seconds')}]")
+        log_line("Starting SCP archive update...")
+        panel = self.query_one("#update-panel", Vertical)
+        download_status = self.query_one("#download-status", Static)
+        process_status = self.query_one("#process-status", Static)
+        download_progress = self.query_one("#download-progress", ProgressBar)
+        process_progress = self.query_one("#process-progress", ProgressBar)
+        process_article_id = self.query_one("#process-article-id", Static)
+        panel.display = True
+        download_status.update("Downloading series: starting...")
+        process_status.update("Processing articles")
+        process_article_id.update("")
+        download_progress.update(progress=0)
+        process_progress.update(progress=0)
         try:
             process = await asyncio.create_subprocess_exec(
                 sys.executable,
                 "-u",
                 loader_path,
-                "--textual-progress",
                 cwd=os.path.dirname(__file__),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
         except OSError as error:
-            status.display = False
-            progress.display = False
-            self.write_output(f"Could not start scp_loader.py: {error}")
+            panel.display = False
+            message = f"Could not start scp_loader.py: {error}"
+            self.write_output(message)
+            log_line(message)
+            if log_file is not None:
+                log_file.close()
             return
 
-        if process.stdout is not None:
-            while True:
-                line = await process.stdout.readline()
-                if not line:
-                    break
-                output = line.decode(errors="replace").strip()
-                if output:
-                    self.handle_loader_output(output)
+        try:
+            if process.stdout is not None:
+                while True:
+                    line = await process.stdout.readline()
+                    if not line:
+                        break
+                    output = line.decode(errors="replace").rstrip("\r\n")
+                    if output:
+                        events = self.parse_loader_events(output)
+                        if events is None:
+                            log_line(output)
+                            self.write_output(output)
+                            continue
+                        for event in events:
+                            if event.get("event") not in {
+                                "progress",
+                                "article-progress",
+                            }:
+                                log_line(json.dumps(event, ensure_ascii=False))
+                            self.handle_loader_event(event)
 
-        return_code = await process.wait()
-        if return_code:
-            status.display = False
-            progress.display = False
-            self.write_output(f"Archive update failed (exit code {return_code}).")
-            return
+            return_code = await process.wait()
+            if return_code:
+                panel.display = False
+                message = f"Archive update failed (exit code {return_code})."
+                self.write_output(message)
+                log_line(message)
+                return
 
-        self.index_error = None
-        self.index = self.load_index()
-        if self.index is None:
-            status.display = False
-            progress.display = False
-            error = f": {self.index_error}" if self.index_error else ""
-            self.write_output(f"Loader finished, but the article index is unavailable{error}.")
-            return
-        status.display = False
-        progress.display = False
-        self.write_output(f"Archive updated. {len(self.index)} articles indexed.")
+            self.index_error = None
+            self.index = self.load_index()
+            if self.index is None:
+                panel.display = False
+                error = f": {self.index_error}" if self.index_error else ""
+                message = f"Loader finished, but the article index is unavailable{error}."
+                self.write_output(message)
+                log_line(message)
+                return
+            panel.display = False
+            message = f"Archive updated. {len(self.index)} articles indexed."
+            self.write_output(message)
+            log_line(message)
+        finally:
+            if log_file is not None:
+                log_file.close()
 
     def handle_loader_output(self, output):
-        try:
-            event = json.loads(output)
-        except json.JSONDecodeError:
+        events = self.parse_loader_events(output)
+        if events is None:
             self.write_output(output)
             return
-        if not isinstance(event, dict) or event.get("event") != "progress":
+        for event in events:
+            self.handle_loader_event(event)
+
+    def handle_loader_event(self, event):
+        if event.get("event") == "article-progress":
+            article_id = event.get("article_id")
+            if isinstance(article_id, str):
+                self.query_one("#process-article-id", Static).update(f"- {article_id}")
+            return
+        if event.get("event") != "progress":
             self.write_output(output)
             return
 
@@ -742,11 +848,37 @@ class SCPReader(App):
             self.write_output(output)
             return
 
-        percent = completed * 100 / total if total > 0 else 100
-        self.query_one("#update-status", Static).update(
-            f"{stage}: {completed}/{total}"
+        if stage == "Processing articles":
+            status = self.query_one("#process-status", Static)
+            progress = self.query_one("#process-progress", ProgressBar)
+            status.update("Processing articles")
+        else:
+            status = self.query_one("#download-status", Static)
+            progress = self.query_one("#download-progress", ProgressBar)
+            status.update(f"{stage}: {completed}/{total}")
+        progress.update(
+            total=total if total > 0 else 1,
+            progress=completed if total > 0 else 1,
         )
-        self.query_one("#update-progress", ProgressBar).update(progress=percent)
+
+    @staticmethod
+    def parse_loader_events(output):
+        decoder = json.JSONDecoder()
+        events = []
+        position = 0
+        while position < len(output):
+            while position < len(output) and output[position].isspace():
+                position += 1
+            if position == len(output):
+                break
+            try:
+                event, position = decoder.raw_decode(output, position)
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(event, dict):
+                return None
+            events.append(event)
+        return events or None
 
     async def action_close_active_tab(self):
         tabs = self.query_one("#workspace-tabs", TabbedContent)

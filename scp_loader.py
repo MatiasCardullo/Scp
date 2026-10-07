@@ -1,13 +1,12 @@
-import argparse
 import json
 import os
 import re
+import time
 import requests
 from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from threading import Lock
 from urllib.parse import quote, urljoin, urlparse
-from tqdm import tqdm
 
 BASE_FOLDER = "scp_data"
 JSON_FOLDER = os.path.join(BASE_FOLDER, "json")
@@ -20,12 +19,22 @@ SCP_ID_RE = re.compile(r"^SCP-\d+[\w-]*$", re.IGNORECASE)
 SERIES_LINK_RE = re.compile(r"^/?(SCP-\d+[\w-]*)$", re.IGNORECASE)
 
 MAX_WORKERS = 4  # Number of files processed/downloaded concurrently.
+IMAGE_DOWNLOAD_ATTEMPTS = 3
+IMAGE_REQUEST_HEADERS = {
+    "User-Agent": "SCP-Terminal-Archive/1.0 (https://github.com/MatiasCardullo/Scp)"
+}
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
 SCP_HREF_RE = re.compile(r'^/scp-(\d+[\w-]*)', re.IGNORECASE)
 SCP_MENTION_RE = re.compile(r'\b(SCP-\d{1,4})\b')
+output_lock = Lock()
 download_queue = []
 queue_lock = Lock()
 _enqueued_urls = set()
+
+
+def emit_output(*args, **kwargs):
+    with output_lock:
+        print(*args, **kwargs)
 
 
 def ensure_folder(path):
@@ -33,7 +42,7 @@ def ensure_folder(path):
 
 
 def emit_progress(desc, completed, total):
-    print(
+    emit_output(
         json.dumps(
             {
                 "event": "progress",
@@ -46,43 +55,52 @@ def emit_progress(desc, completed, total):
     )
 
 
-def run_parallel(items, worker_fn, desc, line_progress=False):
-    """Run worker_fn concurrently, with tqdm or line-oriented progress output."""
+def emit_article_progress(article_id):
+    emit_output(
+        json.dumps({"event": "article-progress", "article_id": article_id}),
+        flush=True,
+    )
+
+
+def run_parallel(items, worker_fn, desc):
+    """Run worker_fn concurrently and emit progress events for the reader."""
     results = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(worker_fn, item): item for item in items}
-        completed = 0
-        last_percent = -1
-        if line_progress:
-            emit_progress(desc, 0, len(futures))
-            futures_iter = as_completed(futures)
-        else:
-            futures_iter = tqdm(as_completed(futures), total=len(futures), desc=desc)
-        for future in futures_iter:
-            results.append(future.result())
-            if line_progress:
-                completed += 1
-                percent = int(completed * 100 / len(futures)) if futures else 100
-                if percent != last_percent:
-                    emit_progress(desc, completed, len(futures))
-                    last_percent = percent
+        emit_progress(desc, 0, len(futures))
+        for completed, future in enumerate(as_completed(futures), start=1):
+            result = future.result()
+            results.append(result)
+            emit_progress(desc, completed, len(futures))
     return results
 
 
-def download_json_file(filename):
+def download_json_file(filename, force_process=False):
     filepath = os.path.join(JSON_FOLDER, filename)
-    if os.path.exists(filepath):
-        return filepath
     url = BASE_JSON_URL + filename
     try:
         r = requests.get(url, timeout=30)
         r.raise_for_status()
-        with open(filepath, "wb") as f:
-            f.write(r.content)
-        return filepath
+        remote_data = r.json()
+        if os.path.exists(filepath):
+            try:
+                with open(filepath, encoding="utf-8") as existing_file:
+                    if json.load(existing_file) == remote_data:
+                        return filepath, force_process
+            except (OSError, json.JSONDecodeError):
+                pass
+        temporary_path = filepath + ".tmp"
+        try:
+            with open(temporary_path, "wb") as file:
+                file.write(r.content)
+            os.replace(temporary_path, filepath)
+        finally:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+        return filepath, True
     except Exception as e:
-        tqdm.write(f"Error downloading {filename}: {e}")
-        return None
+        emit_output(f"Error downloading {filename}: {e}", flush=True)
+        return (filepath, False) if os.path.exists(filepath) else None
 
 
 def image_filename_from_url(url):
@@ -113,13 +131,28 @@ def download_image(item):
     url, path = item
     if os.path.exists(path):
         return
-    try:
-        r = requests.get(url, timeout=20)
-        r.raise_for_status()
-        with open(path, "wb") as f:
-            f.write(r.content)
-    except Exception as e:
-        tqdm.write(f"Image error for {url}: {e}")
+    for attempt in range(1, IMAGE_DOWNLOAD_ATTEMPTS + 1):
+        try:
+            response = requests.get(
+                url,
+                headers=IMAGE_REQUEST_HEADERS,
+                timeout=20,
+            )
+            response.raise_for_status()
+            with open(path, "wb") as file:
+                file.write(response.content)
+            return
+        except requests.RequestException as error:
+            status_code = getattr(getattr(error, "response", None), "status_code", None)
+            retryable = status_code == 429 or status_code is None or status_code >= 500
+            if retryable and attempt < IMAGE_DOWNLOAD_ATTEMPTS:
+                time.sleep(attempt)
+                continue
+            emit_output(f"Image error for {url}: {error}", flush=True)
+            return
+        except OSError as error:
+            emit_output(f"Image error for {url}: {error}", flush=True)
+            return
 
 
 def build_image_url_map(soup):
@@ -313,7 +346,7 @@ def build_wikidot_article(link, page_html):
     }
 
 
-def update_scp_001_json(textual_progress=False):
+def update_scp_001_json(force_process=False):
     """Save the official index page and every proposal into the SCP-001 JSON."""
     index_url = wikidot_url("scp-001")
     response = requests.get(index_url, timeout=30)
@@ -330,7 +363,6 @@ def update_scp_001_json(textual_progress=False):
         proposal_links,
         fetch_article,
         "Downloading SCP-001 proposals",
-        line_progress=textual_progress,
     )
     records = {
         "SCP-001": build_wikidot_article("scp-001", response.text),
@@ -340,9 +372,16 @@ def update_scp_001_json(textual_progress=False):
         records[link] = record
 
     filepath = os.path.join(JSON_FOLDER, "content_scp-001.json")
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, encoding="utf-8") as file:
+                if json.load(file) == records:
+                    return filepath, force_process
+        except (OSError, json.JSONDecodeError):
+            pass
     with open(filepath, "w", encoding="utf-8") as file:
         json.dump(records, file, ensure_ascii=False)
-    return filepath
+    return filepath, True
 
 
 def fetch_series_titles():
@@ -354,12 +393,12 @@ def fetch_series_titles():
             response = requests.get(url, timeout=30)
             response.raise_for_status()
         except requests.RequestException as error:
-            tqdm.write(f"Error downloading series {series_number} titles: {error}")
+            emit_output(f"Error downloading series {series_number} titles: {error}", flush=True)
             continue
 
         series_titles = extract_series_titles(response.text)
         if not series_titles:
-            tqdm.write(f"No article titles found on {response.url}")
+            emit_output(f"No article titles found on {response.url}", flush=True)
             continue
         titles.update(series_titles)
     return titles
@@ -376,7 +415,7 @@ def build_article_index(json_files):
             for article_id, entry in data.items():
                 link = entry.get("link")
                 if not isinstance(link, str) or not link.strip():
-                    tqdm.write(
+                    emit_output(
                         f"Skipping {article_id} in {os.path.basename(path)}: "
                         "missing API link"
                     )
@@ -407,12 +446,17 @@ def build_article_index(json_files):
                 articles_by_link[normalized_link] = article
                 links_by_id[article["scp_id"].upper()] = article
         except (OSError, json.JSONDecodeError) as error:
-            tqdm.write(f"Error reading {path}: {error}")
+            emit_output(f"Error reading {path}: {error}", flush=True)
     return articles_by_link, links_by_id
 
 
 def process_json_file(
-    filepath, subfolder_name, articles_by_link, links_by_id, titles_by_reference
+    filepath,
+    subfolder_name,
+    articles_by_link,
+    links_by_id,
+    titles_by_reference,
+    article_progress=None,
 ):
     """Process a series JSON file: generate HTML for each article (with links
     between SCPs, local images, and no self-references) and return its partial
@@ -422,7 +466,7 @@ def process_json_file(
         with open(filepath, encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
-        tqdm.write(f"Error reading {filepath}: {e}")
+        emit_output(f"Error reading {filepath}: {e}", flush=True)
         return partial_index
 
     def find_article_location(mention):
@@ -433,9 +477,11 @@ def process_json_file(
         return article, f"{article['folder']}/{article['html_file']}"
 
     for article_id, entry in data.items():
+        if article_progress is not None:
+            article_progress(article_id)
         link = entry.get("link")
         if not isinstance(link, str) or not link.strip():
-            tqdm.write(
+            emit_output(
                 f"Skipping {article_id} in {os.path.basename(filepath)}: "
                 "missing API link"
             )
@@ -444,7 +490,7 @@ def process_json_file(
         normalized_link = normalize_link(link)
         article = articles_by_link.get(normalized_link)
         if article is None:
-            tqdm.write(f"Skipping {article_id}: API link was not indexed")
+            emit_output(f"Skipping {article_id}: API link was not indexed", flush=True)
             continue
 
         if subfolder_name.casefold() == "scp-001":
@@ -517,7 +563,7 @@ def process_json_file(
             with open(html_path, "w", encoding="utf-8") as f:
                 f.write(str(soup))
         except Exception as e:
-            tqdm.write(f"Error saving HTML for {article_id}: {e}")
+            emit_output(f"Error saving HTML for {article_id}: {e}", flush=True)
             continue
 
         index_entry = {
@@ -536,83 +582,265 @@ def process_json_file(
     return partial_index
 
 
-def main(textual_progress=False):
+def queue_missing_images(json_files):
+    """Queue external images referenced by source JSON whose local copy is absent."""
+    for filepath, _ in json_files:
+        try:
+            with open(filepath, encoding="utf-8") as file:
+                data = json.load(file)
+        except (OSError, json.JSONDecodeError) as error:
+            emit_output(f"Error reading {filepath} while checking images: {error}", flush=True)
+            continue
+
+        for entry in data.values():
+            if not isinstance(entry, dict):
+                continue
+            html = entry.get("raw_content") or entry.get("raw_source", "")
+            if not isinstance(html, str):
+                continue
+            soup = BeautifulSoup(html, "html.parser")
+            url_map = build_image_url_map(soup)
+            for image in soup.find_all("img"):
+                image_url = resolve_image_url(image, url_map)
+                if image_url and not os.path.isfile(
+                    os.path.join(IMG_FOLDER, image_filename_from_url(image_url))
+                ):
+                    enqueue_image(image_url)
+
+
+def source_needs_processing(previous_index, source_filename):
+    if previous_index is None:
+        return True
+    entries = [
+        metadata
+        for metadata in previous_index.values()
+        if isinstance(metadata, dict)
+        and metadata.get("json_file") == source_filename
+    ]
+    if not entries:
+        return True
+    return any(
+        not metadata.get("folder")
+        or not metadata.get("html_file")
+        or not os.path.isfile(
+            os.path.join(
+                HTML_FOLDER,
+                metadata["folder"],
+                metadata["html_file"],
+            )
+        )
+        for metadata in entries
+    )
+
+
+def download_and_process_files(
+    jobs,
+    file_to_key,
+    titles_by_reference,
+    on_downloads_complete=None,
+):
+    downloaded_files = []
+    changed_files = []
+    partial_indexes = []
+    download_completed = 0
+    process_completed = 0
+    download_futures = {}
+    process_futures = {}
+    cached_files = [
+        (os.path.join(JSON_FOLDER, filename), source_key)
+        for filename, source_key in file_to_key.items()
+        if os.path.isfile(os.path.join(JSON_FOLDER, filename))
+    ]
+    articles_by_link, links_by_id = build_article_index(cached_files)
+    emit_progress("Downloading series", 0, len(jobs))
+    emit_progress("Processing articles", 0, len(jobs))
+
+    with (
+        ThreadPoolExecutor(max_workers=MAX_WORKERS) as download_pool,
+        ThreadPoolExecutor(max_workers=MAX_WORKERS) as process_pool,
+    ):
+        for filename, force_process in jobs:
+            future = download_pool.submit(
+                download_json_file, filename, force_process=force_process
+            )
+            download_futures[future] = filename
+
+        downloads_complete_notified = False
+        while download_futures or process_futures:
+            completed, _ = wait(
+                (*download_futures, *process_futures),
+                return_when=FIRST_COMPLETED,
+            )
+            for future in completed:
+                if future in download_futures:
+                    filename = download_futures.pop(future)
+                    result = future.result()
+                    download_completed += 1
+                    emit_progress("Downloading series", download_completed, len(jobs))
+
+                    if result is None:
+                        process_completed += 1
+                    else:
+                        path, needs_processing = result
+                        key = file_to_key[filename]
+                        downloaded_files.append((path, key))
+                        file_articles, file_links_by_id = build_article_index(
+                            [(path, key)]
+                        )
+                        articles_by_link.update(file_articles)
+                        links_by_id.update(file_links_by_id)
+                        if needs_processing:
+                            process_future = process_pool.submit(
+                                process_json_file,
+                                path,
+                                key,
+                                dict(articles_by_link),
+                                dict(links_by_id),
+                                titles_by_reference,
+                                article_progress=emit_article_progress,
+                            )
+                            process_futures[process_future] = (path, key)
+                            changed_files.append((path, key))
+                        else:
+                            process_completed += 1
+                else:
+                    process_futures.pop(future)
+                    partial_indexes.append(future.result())
+                    process_completed += 1
+
+                emit_progress("Processing articles", process_completed, len(jobs))
+
+            if not download_futures and not downloads_complete_notified:
+                downloads_complete_notified = True
+                if on_downloads_complete is not None:
+                    on_downloads_complete()
+
+        if not downloads_complete_notified and on_downloads_complete is not None:
+            on_downloads_complete()
+
+    return downloaded_files, changed_files, partial_indexes
+
+
+def main():
     ensure_folder(BASE_FOLDER)
     ensure_folder(JSON_FOLDER)
     ensure_folder(HTML_FOLDER)
     ensure_folder(IMG_FOLDER)
+    download_queue.clear()
+    with queue_lock:
+        _enqueued_urls.clear()
 
-    print("Downloading content index...")
+    emit_output("Downloading content index...")
     try:
         content_index = requests.get(CONTENT_INDEX_URL, timeout=30).json()
     except Exception as e:
-        print(f"Error downloading content index: {e}")
+        emit_output(f"Error downloading content index: {e}")
         return 1
 
     file_to_key = {v: k for k, v in content_index.items()}
 
-    downloaded_paths = run_parallel(
-        list(content_index.values()),
-        download_json_file,
-        "Downloading series",
-        line_progress=textual_progress,
-    )
-    try:
-        update_scp_001_json(textual_progress=textual_progress)
-    except (requests.RequestException, ValueError, OSError) as error:
-        print(f"Error downloading SCP-001 proposals: {error}")
-        return 1
-
-    json_files = [
-        (path, file_to_key.get(os.path.basename(path), "misc"))
-        for path in downloaded_paths if path
-    ]
-
-    articles_by_link, links_by_id = build_article_index(json_files)
-    print(f"Found {len(articles_by_link)} API links. Loading official SCP titles...")
+    emit_output("Loading official SCP titles...")
     titles_by_reference = fetch_series_titles()
-
-    partial_indexes = run_parallel(
-        json_files,
-        lambda item: process_json_file(
-            item[0], item[1], articles_by_link, links_by_id, titles_by_reference
-        ),
-        "Processing articles",
-        line_progress=textual_progress,
-    )
-
-    # Generate the index as soon as the HTML is ready, before downloading images.
-    index = {}
-    for partial in partial_indexes:
-        index.update(partial)
 
     index_path = os.path.join(BASE_FOLDER, "index.json")
     try:
+        with open(index_path, encoding="utf-8") as file:
+            previous_index = json.load(file)
+        if not isinstance(previous_index, dict):
+            previous_index = None
+    except (OSError, json.JSONDecodeError):
+        previous_index = None
+    force_process_by_file = {
+        filename: source_needs_processing(previous_index, filename)
+        for filename in content_index.values()
+    }
+
+    proposal_results = []
+
+    def download_proposals():
+        proposal_results.append(
+            update_scp_001_json(
+                force_process=source_needs_processing(
+                    previous_index, "content_scp-001.json"
+                ),
+            )
+        )
+
+    try:
+        downloaded_files, changed_files, partial_indexes = download_and_process_files(
+            [
+                (filename, force_process_by_file[filename])
+                for filename in content_index.values()
+            ],
+            file_to_key,
+            titles_by_reference,
+            on_downloads_complete=download_proposals,
+        )
+    except (requests.RequestException, ValueError, OSError) as error:
+        emit_output(f"Error downloading SCP-001 proposals: {error}")
+        return 1
+    scp_001_path, scp_001_changed = proposal_results[0]
+    scp_001_file = (scp_001_path, "scp-001")
+    downloaded_files.append(scp_001_file)
+    if scp_001_changed:
+        current_files = [
+            (os.path.join(JSON_FOLDER, source_filename), source_key)
+            for source_filename, source_key in file_to_key.items()
+            if os.path.exists(os.path.join(JSON_FOLDER, source_filename))
+        ]
+        current_files.append(scp_001_file)
+        articles_by_link, links_by_id = build_article_index(current_files)
+        partial_indexes.append(
+            process_json_file(
+                scp_001_path,
+                "scp-001",
+                articles_by_link,
+                links_by_id,
+                titles_by_reference,
+                article_progress=emit_article_progress,
+            )
+        )
+        changed_files.append(scp_001_file)
+
+    json_files = list(dict.fromkeys(downloaded_files))
+    queue_missing_images(json_files)
+
+    articles_by_link, links_by_id = build_article_index(json_files)
+    emit_output(f"Found {len(articles_by_link)} API links.")
+
+    changed_filenames = {os.path.basename(path) for path, _ in changed_files}
+    unchanged_filenames = {
+        os.path.basename(path)
+        for path, _ in json_files
+        if os.path.basename(path) not in changed_filenames
+    }
+    index = {
+        identity: metadata
+        for identity, metadata in (previous_index or {}).items()
+        if isinstance(metadata, dict)
+        and metadata.get("json_file") in unchanged_filenames
+    }
+    for partial in partial_indexes:
+        index.update(partial)
+
+    try:
         with open(index_path, "w", encoding="utf-8") as f:
             json.dump(index, f, ensure_ascii=False)
-        print(f"Index generated: {index_path} ({len(index)} entries)")
+        emit_output(f"Index generated: {index_path} ({len(index)} entries)")
     except Exception as e:
-        print(f"Error saving index: {e}")
+        emit_output(f"Error saving index: {e}")
         return 1
 
-    print(f"Downloading images ({len(download_queue)} files)...", flush=True)
+    emit_output(f"Downloading images ({len(download_queue)} files)...", flush=True)
     run_parallel(
         list(download_queue),
         download_image,
         "Downloading images",
-        line_progress=textual_progress,
     )
 
-    print("All articles and resources have been processed.")
+    emit_output("All articles and resources have been processed.")
     return 0
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--textual-progress",
-        action="store_true",
-        help="Emit line-oriented JSON progress events for a Textual interface.",
-    )
-    args = parser.parse_args()
-    raise SystemExit(main(textual_progress=args.textual_progress))
+    raise SystemExit(main())

@@ -48,7 +48,7 @@ A Textual TUI with a retro terminal look (dark background, green text, and keybo
 | `SCP-173` or `173` | Opens an article in its own scrollable tab |
 | `list` | Shows clickable series titles and article counts |
 | `list <series>` | Shows that series' article IDs and clickable titles, one per line |
-| `update` | Runs `scp_loader.py`, shows live progress in a single status bar, and reloads the article index when it finishes |
+| `update` | Runs `scp_loader.py`, shows live download and processing progress, and reloads the article index when it finishes |
 | `cls` | Clears the terminal history |
 | `help` | Shows the help message |
 | `exit` / `quit` | Closes the TUI |
@@ -70,12 +70,11 @@ pip install -r requirements.txt
 python main.py
 ```
 
-`python scp_reader.py` remains available as an alternative way to start the reader. Run `update` from the reader to execute the loader and refresh the in-memory index. Its progress updates in place instead of filling the terminal history. The loader retains its existing behavior of reusing JSON files that are already present; run `python scp_loader.py` directly to use the regular `tqdm` progress bars.
 
 ---
 
 ## Current notes / limitations
 
-- `scp_loader.py` does not automatically retry network failures; if a download fails, that file is skipped and processing continues.
+- Image downloads retry temporary network, rate-limit, and server errors; permanently unavailable images are logged and retried on a later update.
 - If `scp_data/index.json` is missing, the reader automatically runs the loader when it starts.
 - The loader stores internal SCP references in article HTML; the reader makes references to locally indexed articles clickable.
