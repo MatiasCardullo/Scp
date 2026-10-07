@@ -391,6 +391,8 @@ class SCPReader(App):
         self.index_error = None
         self.index = self.load_index()
         self.article_pane_ids = {}
+        self.update_active = False
+        self.update_worker = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -454,11 +456,7 @@ class SCPReader(App):
 
     def startup_update(self):
         self.prepare_command("update")
-        self.run_worker(
-            self.handle_command("update"),
-            name="startup-update",
-            group="archive-update",
-        )
+        self.start_archive_update()
 
     def load_index(self):
         if not os.path.exists(INDEX_PATH):
@@ -828,9 +826,9 @@ class SCPReader(App):
         elif normalized.startswith("list "):
             await self.list_scps(command[5:].strip())
         elif normalized == "update":
-            await self.update_archive()
+            self.start_archive_update()
         elif normalized == "update --media":
-            await self.update_archive(download_media=True)
+            self.start_archive_update(download_media=True)
         elif command.upper().startswith("SCP-"):
             await self.show_scp(command)
         elif command.isdigit() and 1 <= int(command) <= 9999:
@@ -859,8 +857,30 @@ class SCPReader(App):
                 group="open-article",
             )
 
+    def start_archive_update(self, download_media=False):
+        if self.update_active:
+            self.write_output("An archive update is already running.")
+            return None
+
+        self.update_active = True
+        self.query_one("#update-panel", Vertical).display = True
+        self.update_worker = self.run_worker(
+            self.run_archive_update(download_media=download_media),
+            name="archive-update",
+            group="archive-update",
+            exit_on_error=False,
+        )
+        return self.update_worker
+
+    async def run_archive_update(self, download_media=False):
+        try:
+            await self.update_archive(download_media=download_media)
+        finally:
+            self.update_active = False
+            self.update_worker = None
+
     async def update_archive(self, download_media=False):
-        loader_path = os.path.join(os.path.dirname(__file__), "scp_loader.py")
+        worker_path = os.path.join(os.path.dirname(__file__), "scp_loader_worker.py")
         self.write_output("Starting SCP archive update...")
         log_file = None
         try:
@@ -896,7 +916,7 @@ class SCPReader(App):
         download_progress.update(progress=0)
         process_progress.update(progress=0)
         try:
-            command = [sys.executable, "-u", loader_path]
+            command = [sys.executable, "-u", worker_path]
             if download_media:
                 command.append("--media")
             process = await asyncio.create_subprocess_exec(
@@ -906,8 +926,7 @@ class SCPReader(App):
                 stderr=asyncio.subprocess.STDOUT,
             )
         except OSError as error:
-            panel.display = False
-            message = f"Could not start scp_loader.py: {error}"
+            message = f"Could not start scp_loader_worker.py: {error}"
             self.write_output(message)
             log_line(message)
             if log_file is not None:
@@ -916,10 +935,12 @@ class SCPReader(App):
 
         try:
             if process.stdout is not None:
+                output_lines = 0
                 while True:
                     line = await process.stdout.readline()
                     if not line:
                         break
+                    output_lines += 1
                     output = line.decode(errors="replace").rstrip("\r\n")
                     if output:
                         events = self.parse_loader_events(output)
@@ -934,10 +955,11 @@ class SCPReader(App):
                             }:
                                 log_line(json.dumps(event, ensure_ascii=False))
                             self.handle_loader_event(event)
+                    if output_lines % 25 == 0:
+                        await asyncio.sleep(0)
 
             return_code = await process.wait()
             if return_code:
-                panel.display = False
                 message = f"Archive update failed (exit code {return_code})."
                 self.write_output(message)
                 log_line(message)
@@ -946,14 +968,16 @@ class SCPReader(App):
             self.index_error = None
             self.index = self.load_index()
             if self.index is None:
-                panel.display = False
                 error = f": {self.index_error}" if self.index_error else ""
                 message = f"Loader finished, but the article index is unavailable{error}."
                 self.write_output(message)
                 log_line(message)
                 return
-            panel.display = False
             message = f"Archive updated. {len(self.index)} articles indexed."
+            self.write_output(message)
+            log_line(message)
+        except (OSError, ValueError, asyncio.SubprocessError) as error:
+            message = f"Archive update error: {error}"
             self.write_output(message)
             log_line(message)
         finally:
@@ -975,20 +999,20 @@ class SCPReader(App):
                 self.query_one("#process-article-id", Static).update(f"- {article_id}")
             return
         if event.get("event") != "progress":
-            self.write_output(output)
+            self.write_output(json.dumps(event, ensure_ascii=False))
             return
 
         completed = event.get("completed")
         total = event.get("total")
         stage = event.get("stage")
         if not isinstance(completed, int) or not isinstance(total, int) or not isinstance(stage, str):
-            self.write_output(output)
+            self.write_output(json.dumps(event, ensure_ascii=False))
             return
 
         if stage == "Processing articles":
             status = self.query_one("#process-status", Static)
             progress = self.query_one("#process-progress", ProgressBar)
-            status.update("Processing articles")
+            status.update(f"{stage}: {completed}/{total}")
         else:
             status = self.query_one("#download-status", Static)
             progress = self.query_one("#download-progress", ProgressBar)
@@ -1047,7 +1071,3 @@ class SCPReader(App):
             and event.tabbed_content.active == "terminal-tab"
         ):
             self.query_one("#command", CommandInput).focus()
-
-
-if __name__ == "__main__":
-    SCPReader().run()

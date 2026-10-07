@@ -3,9 +3,16 @@
 A two-part tool for downloading, cataloging, and reading articles from the [Wikidot SCP Foundation](http://www.scpwiki.com/) locally, with a retro terminal-style interface.
 
 ```
-📥 scp_loader.py   →  downloads and builds the local archive (JSON + HTML + images)
-🖥️  main.py         →  retro terminal for searching and reading downloaded articles
+📥 scp_loader.py        →  downloads and builds the local archive (JSON + HTML + images)
+🖥️  main.py              →  retro terminal for searching and reading downloaded articles
+⚙️  scp_loader_worker.py →  imports the loader update function for reader subprocesses
 ```
+
+## Documentation
+
+- [Project scripts](docs/scripts.md)
+- [API JSON files](docs/api-json.md)
+- [Local data in `scp_data/`](docs/scp-data.md)
 
 ---
 
@@ -34,6 +41,8 @@ scp_data/
 
 The generated `scp_data/index.json` is keyed by the API `link` values. Each entry also stores the SCP identifier used by reader commands, the resolved title, source JSON filename, and generated HTML filename. Local HTML filenames are derived safely from the API link. The reader continues to accept SCP identifiers such as `SCP-173` or `173`.
 
+The loader exposes `update_archive(download_media=False)` for import-based use. The reader starts `scp_loader_worker.py` as a subprocess; the worker imports this function so updates remain isolated from the UI while streaming progress.
+
 SCP-001 pages are read from their rendered Wikidot HTML because the dataset API only includes one proposal. Their records use the same JSON fields as the API articles; unavailable source markup and revision history are left empty.
 
 If a series listing has no title for an article, the loader keeps the API title without reporting each missing title.
@@ -48,11 +57,13 @@ A Textual TUI with a retro terminal look (dark background, green text, and keybo
 | `SCP-173` or `173` | Opens an article in its own scrollable tab |
 | `list` | Shows clickable series titles and article counts |
 | `list <series>` | Shows that series' article IDs and clickable titles, one per line |
-| `update` | Runs `scp_loader.py` without downloading images, shows live progress, and reloads the article index when it finishes |
+| `update` | Runs the loader worker in the background without downloading images, keeping commands and terminal links usable while showing progress |
 | `update --media` | Also downloads article images during the update |
 | `cls` | Clears the terminal history |
 | `help` | Shows the help message |
 | `exit` / `quit` | Closes the TUI |
+
+The update panel reports its stages. Only one update can run at a time; other terminal commands and links remain available during it. Downloads prioritize the four non-series groups (decommissioned, explained, international, joke), then the main series through 10.5. Article processing starts as each main series is downloaded, in SCP-series order, rather than waiting for every download to finish. SCP-001 proposals are downloaded and processed after the main-series downloads.
 
 The Terminal tab keeps command history and clickable article lists. Clicking a series or article echoes and runs the equivalent command in the terminal (for example, `list joke` or `scp-012`). Long series lists and article text are rendered in small batches so the interface remains responsive. Entering a number shared by multiple article variants opens a chooser, with the regular-series article selected by default. The SCP-001 index is listed in Series 1; individual proposals remain archived but are omitted from the series overview. Opened articles appear in separate tabs; switch back to Terminal without losing its history. Reopening an article selects its existing tab. Press `Ctrl+C` to close the active article tab; from the Terminal tab, `Ctrl+C` quits the TUI. Wikidot collapsible sections are shown as interactive controls in article tabs, closed by default; click a heading or focus it and press `Enter` to expand or collapse it. This applies to collapsible blocks wherever they appear in the archive without modifying the downloaded HTML. Images and the rest of the original HTML layout are not rendered in the terminal.
 

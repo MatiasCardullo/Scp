@@ -5,7 +5,7 @@ import re
 import time
 import requests
 from bs4 import BeautifulSoup
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from urllib.parse import quote, urljoin, urlparse
 
@@ -27,6 +27,14 @@ IMAGE_REQUEST_HEADERS = {
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
 SCP_HREF_RE = re.compile(r'^/scp-(\d+[\w-]*)', re.IGNORECASE)
 SCP_MENTION_RE = re.compile(r'\b(SCP-\d{1,4})\b')
+SPECIAL_GROUP_ORDER = {
+    "content_decommissioned.json": 0,
+    "content_explained.json": 1,
+    "content_international.json": 2,
+    "content_joke.json": 3,
+}
+SERIES_FILE_RE = re.compile(r"^series-(\d+(?:\.\d+)?)$", re.IGNORECASE)
+ARTICLE_ID_RE = re.compile(r"^SCP-(\d+)(.*)$", re.IGNORECASE)
 output_lock = Lock()
 download_queue = []
 queue_lock = Lock()
@@ -61,6 +69,53 @@ def emit_article_progress(article_id):
         json.dumps({"event": "article-progress", "article_id": article_id}),
         flush=True,
     )
+
+
+def article_sort_key(article_id):
+    article_id = str(article_id)
+    match = ARTICLE_ID_RE.match(article_id)
+    if not match:
+        return (2, float("inf"), article_id.casefold())
+    number, suffix = match.groups()
+    return (bool(suffix), int(number), suffix.casefold())
+
+
+def article_source_sort_key(source_key):
+    if source_key.casefold() == "scp-001":
+        return (-1, 0, source_key.casefold())
+    match = SERIES_FILE_RE.match(source_key)
+    if not match:
+        return (1, float("inf"), source_key.casefold())
+    return (0, float(match.group(1)), source_key.casefold())
+
+
+def series_sort_key(source_key):
+    match = SERIES_FILE_RE.match(source_key)
+    if not match:
+        return (1, float("inf"), source_key.casefold())
+    return (0, float(match.group(1)), source_key.casefold())
+
+
+def series_for_scp_number(number):
+    if number < 1000:
+        return "series-1"
+    if number < 5000:
+        return f"series-{number // 1000}"
+    group = (number - 5000) // 1000
+    half = ".0" if (number - 5000) % 1000 <= 500 else ".5"
+    return f"series-{6 + group}{half}"
+
+
+def download_order_key(job):
+    filename, source_key = job
+    special_order = SPECIAL_GROUP_ORDER.get(os.path.basename(filename).casefold())
+    if special_order is not None:
+        return (0, special_order, filename.casefold())
+    if not isinstance(source_key, str):
+        source_key = os.path.splitext(os.path.basename(filename))[0].removeprefix(
+            "content_"
+        )
+    return (1, *series_sort_key(source_key), filename.casefold())
 
 
 def run_parallel(items, worker_fn, desc):
@@ -459,6 +514,8 @@ def process_json_file(
     titles_by_reference,
     article_progress=None,
     download_media=False,
+    article_ids=None,
+    additional_articles=None,
 ):
     """Process a series JSON file: generate HTML for each article (with links
     between SCPs, local images, and no self-references) and return its partial
@@ -478,13 +535,33 @@ def process_json_file(
             return None, None
         return article, f"{article['folder']}/{article['html_file']}"
 
-    for article_id, entry in data.items():
+    selected_ids = set(article_ids) if article_ids is not None else None
+    article_records = [
+        (article_id, entry, filepath, subfolder_name)
+        for article_id, entry in data.items()
+        if selected_ids is None or article_id in selected_ids
+    ]
+    article_records.extend(
+        (article_id, entry, source_path, source_folder)
+        for source_path, source_folder, article_id, entry in (
+            additional_articles or []
+        )
+    )
+    article_records.sort(
+        key=lambda record: (
+            *article_sort_key(record[1].get("scp", record[0])),
+            *article_source_sort_key(record[3]),
+            str(record[0]).casefold(),
+        )
+    )
+
+    for article_id, entry, source_path, source_folder in article_records:
         if article_progress is not None:
             article_progress(article_id)
         link = entry.get("link")
         if not isinstance(link, str) or not link.strip():
             emit_output(
-                f"Skipping {article_id} in {os.path.basename(filepath)}: "
+                f"Skipping {article_id} in {os.path.basename(source_path)}: "
                 "missing API link"
             )
             continue
@@ -495,7 +572,7 @@ def process_json_file(
             emit_output(f"Skipping {article_id}: API link was not indexed", flush=True)
             continue
 
-        if subfolder_name.casefold() == "scp-001":
+        if source_folder.casefold() == "scp-001":
             title = entry.get("title") or article_id
         else:
             title = (
@@ -575,7 +652,7 @@ def process_json_file(
             "scp_id": article.get("scp_id", article_id),
             "title": title,
             "folder": article["folder"],
-            "json_file": os.path.basename(filepath),
+            "json_file": os.path.basename(source_path),
             "html_file": filename,
         }
         if article_id.casefold() != index_entry["scp_id"].casefold():
@@ -611,15 +688,26 @@ def queue_missing_images(json_files):
                     enqueue_image(image_url)
 
 
-def source_needs_processing(previous_index, source_filename):
+def index_entries_by_source(previous_index):
+    entries_by_source = {}
+    if not isinstance(previous_index, dict):
+        return entries_by_source
+
+    for metadata in previous_index.values():
+        if not isinstance(metadata, dict):
+            continue
+        source_filename = metadata.get("json_file")
+        if isinstance(source_filename, str):
+            entries_by_source.setdefault(source_filename, []).append(metadata)
+    return entries_by_source
+
+
+def source_needs_processing(previous_index, source_filename, entries_by_source=None):
     if previous_index is None:
         return True
-    entries = [
-        metadata
-        for metadata in previous_index.values()
-        if isinstance(metadata, dict)
-        and metadata.get("json_file") == source_filename
-    ]
+    if entries_by_source is None:
+        entries_by_source = index_entries_by_source(previous_index)
+    entries = entries_by_source.get(source_filename, [])
     if not entries:
         return True
     return any(
@@ -647,86 +735,299 @@ def download_and_process_files(
     changed_files = []
     partial_indexes = []
     download_completed = 0
+    downloaded_by_filename = {}
+    processed_filenames = set()
     process_completed = 0
-    download_futures = {}
-    process_futures = {}
+    process_total = 0
     cached_files = [
         (os.path.join(JSON_FOLDER, filename), source_key)
         for filename, source_key in file_to_key.items()
         if os.path.isfile(os.path.join(JSON_FOLDER, filename))
     ]
-    articles_by_link, links_by_id = build_article_index(cached_files)
-    emit_progress("Downloading series", 0, len(jobs))
-    emit_progress("Processing articles", 0, len(jobs))
+    download_jobs = sorted(jobs, key=download_order_key)
+    emit_progress("Downloading special groups", 0, len(download_jobs))
 
-    with (
-        ThreadPoolExecutor(max_workers=MAX_WORKERS) as download_pool,
-        ThreadPoolExecutor(max_workers=MAX_WORKERS) as process_pool,
-    ):
-        for filename, force_process in jobs:
-            future = download_pool.submit(
-                download_json_file, filename, force_process=force_process
-            )
-            download_futures[future] = filename
+    special_jobs = [
+        job for job in download_jobs
+        if os.path.basename(job[0]).casefold() in SPECIAL_GROUP_ORDER
+    ]
+    other_jobs = [job for job in download_jobs if job not in special_jobs]
+    downloads_complete_notified = False
 
-        downloads_complete_notified = False
-        while download_futures or process_futures:
-            completed, _ = wait(
-                (*download_futures, *process_futures),
-                return_when=FIRST_COMPLETED,
-            )
-            for future in completed:
-                if future in download_futures:
-                    filename = download_futures.pop(future)
+    def notify_downloads_complete():
+        nonlocal downloads_complete_notified
+        if downloads_complete_notified or on_downloads_complete is None:
+            return
+        downloads_complete_notified = True
+        result = on_downloads_complete()
+        if result is None:
+            return
+        path, needs_processing = result
+        filename = os.path.basename(path)
+        downloaded_by_filename[filename] = (path, "scp-001", needs_processing)
+        downloaded_files.append((path, "scp-001"))
+        if needs_processing:
+            changed_files.append((path, "scp-001"))
+
+    for batch_index, batch in enumerate((special_jobs, other_jobs)):
+        if not batch:
+            continue
+        stage = (
+            "Downloading special groups"
+            if batch_index == 0
+            else "Downloading series"
+        )
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(
+                    download_json_file,
+                    filename,
+                    force_process=force_process,
+                ): filename
+                for filename, force_process in batch
+            }
+            if batch_index == 0:
+                for future in as_completed(futures):
+                    filename = futures[future]
                     result = future.result()
                     download_completed += 1
-                    emit_progress("Downloading series", download_completed, len(jobs))
-
-                    if result is None:
-                        process_completed += 1
-                    else:
+                    emit_progress(stage, download_completed, len(download_jobs))
+                    if result is not None:
                         path, needs_processing = result
                         key = file_to_key[filename]
+                        downloaded_by_filename[filename] = (path, key, needs_processing)
                         downloaded_files.append((path, key))
-                        file_articles, file_links_by_id = build_article_index(
-                            [(path, key)]
-                        )
-                        articles_by_link.update(file_articles)
-                        links_by_id.update(file_links_by_id)
                         if needs_processing:
-                            process_future = process_pool.submit(
-                                process_json_file,
-                                path,
-                                key,
-                                dict(articles_by_link),
-                                dict(links_by_id),
-                                titles_by_reference,
-                                article_progress=emit_article_progress,
-                                download_media=download_media,
-                            )
-                            process_futures[process_future] = (path, key)
                             changed_files.append((path, key))
-                        else:
-                            process_completed += 1
+            else:
+                ordered_series = [
+                    filename
+                    for filename, _ in sorted(batch, key=download_order_key)
+                    if SERIES_FILE_RE.match(file_to_key[filename])
+                ]
+                completed_results = {}
+
+                def process_ready_series(filename):
+                    nonlocal process_completed, process_total
+                    source = downloaded_by_filename.get(filename)
+                    if source is None:
+                        return
+                    path, key, needs_processing = source
+                    if not needs_processing:
+                        return
+                    try:
+                        with open(path, encoding="utf-8") as file:
+                            data = json.load(file)
+                    except (OSError, json.JSONDecodeError) as error:
+                        emit_output(f"Error reading {path}: {error}", flush=True)
+                        return
+
+                    article_ids = [
+                        article_id
+                        for article_id, entry in data.items()
+                        if isinstance(entry, dict)
+                    ]
+                    article_count = len(article_ids)
+                    available_files = [
+                        (file_path, source_key)
+                        for file_path, source_key, _ in downloaded_by_filename.values()
+                    ]
+                    articles_by_link, links_by_id = build_article_index(
+                        list(dict.fromkeys(cached_files + available_files))
+                    )
+                    process_total += article_count
+                    emit_progress(
+                        "Processing articles", process_completed, process_total
+                    )
+
+                    def report_progress(article_id):
+                        nonlocal process_completed
+                        process_completed += 1
+                        emit_article_progress(article_id)
+                        if (
+                            process_completed == 1
+                            or process_completed % 10 == 0
+                            or process_completed == process_total
+                        ):
+                            emit_progress(
+                                "Processing articles", process_completed, process_total
+                            )
+
+                    partial_indexes.append(
+                        process_json_file(
+                            path,
+                            key,
+                            articles_by_link,
+                            links_by_id,
+                            titles_by_reference,
+                            article_progress=report_progress,
+                            download_media=download_media,
+                            article_ids=article_ids,
+                        )
+                    )
+                    processed_filenames.add(filename)
+                    emit_progress(
+                        "Processing articles", process_completed, process_total
+                    )
+
+                next_series = 0
+                for future in as_completed(futures):
+                    filename = futures[future]
+                    result = future.result()
+                    download_completed += 1
+                    emit_progress(stage, download_completed, len(download_jobs))
+                    completed_results[filename] = result
+                    if result is not None:
+                        path, needs_processing = result
+                        key = file_to_key[filename]
+                        downloaded_by_filename[filename] = (path, key, needs_processing)
+                        downloaded_files.append((path, key))
+                        if needs_processing:
+                            changed_files.append((path, key))
+
+                    while (
+                        next_series < len(ordered_series)
+                        and ordered_series[next_series] in completed_results
+                    ):
+                        process_ready_series(ordered_series[next_series])
+                        next_series += 1
+
+    notify_downloads_complete()
+
+    available_files = [
+        (path, key) for path, key, _ in downloaded_by_filename.values()
+    ]
+    articles_by_link, links_by_id = build_article_index(
+        list(dict.fromkeys(cached_files + available_files))
+    )
+
+    regular_batches = {}
+    variant_articles = []
+    for filename, (path, key, needs_processing) in downloaded_by_filename.items():
+        if not needs_processing or filename in processed_filenames:
+            continue
+        try:
+            with open(path, encoding="utf-8") as file:
+                data = json.load(file)
+        except (OSError, json.JSONDecodeError) as error:
+            emit_output(f"Error reading {path}: {error}", flush=True)
+            continue
+
+        is_series = SERIES_FILE_RE.match(key) is not None
+        regular_ids = []
+        for article_id, entry in data.items():
+            if not isinstance(entry, dict):
+                continue
+            resolved_id = entry.get("scp", article_id)
+            match = ARTICLE_ID_RE.match(str(resolved_id))
+            if not match:
+                regular_batches.setdefault("other", []).append(
+                    (path, key, article_id, entry)
+                )
+                continue
+            number, suffix = match.groups()
+            if suffix:
+                variant_articles.append((path, key, article_id, entry))
+            elif 1 <= int(number) <= 9999:
+                group = series_for_scp_number(int(number))
+                if is_series and group == key:
+                    regular_ids.append(article_id)
                 else:
-                    process_futures.pop(future)
-                    partial_indexes.append(future.result())
-                    process_completed += 1
+                    regular_batches.setdefault(group, []).append(
+                        (path, key, article_id, entry)
+                    )
+            else:
+                regular_batches.setdefault("other", []).append(
+                    (path, key, article_id, entry)
+                )
 
-                emit_progress("Processing articles", process_completed, len(jobs))
+        if regular_ids:
+            regular_batches.setdefault(key, [])
+            regular_batches[key].insert(
+                0,
+                (path, key, None, regular_ids),
+            )
 
-            if not download_futures and not downloads_complete_notified:
-                downloads_complete_notified = True
-                if on_downloads_complete is not None:
-                    on_downloads_complete()
+    ordered_groups = sorted(
+        regular_batches,
+        key=lambda group: (
+            series_sort_key(group) if group != "other" else (2, float("inf"), group)
+        ),
+    )
+    process_total += sum(
+        len(next((record[3] for record in records if record[2] is None), []))
+        + sum(1 for record in records if record[2] is not None)
+        for records in regular_batches.values()
+    ) + len(variant_articles)
+    emit_progress("Processing articles", process_completed, process_total)
 
-        if not downloads_complete_notified and on_downloads_complete is not None:
-            on_downloads_complete()
+    def report_article_progress(article_id):
+        nonlocal process_completed
+        process_completed += 1
+        emit_article_progress(article_id)
+        if (
+            process_completed == 1
+            or process_completed % 10 == 0
+            or process_completed == process_total
+        ):
+            emit_progress("Processing articles", process_completed, process_total)
 
-    return downloaded_files, changed_files, partial_indexes
+    for group in ordered_groups:
+        records = regular_batches[group]
+        main_record = next(
+            (record for record in records if record[2] is None),
+            None,
+        )
+        if main_record is not None:
+            path, key, _, article_ids = main_record
+            additional_articles = [
+                record for record in records if record[2] is not None
+            ]
+        else:
+            path, key, _, _ = records[0]
+            article_ids = []
+            additional_articles = records
+        partial_indexes.append(
+            process_json_file(
+                path,
+                key,
+                articles_by_link,
+                links_by_id,
+                titles_by_reference,
+                article_progress=report_article_progress,
+                download_media=download_media,
+                article_ids=article_ids,
+                additional_articles=additional_articles,
+            )
+        )
+
+    if variant_articles:
+        variant_articles.sort(
+            key=lambda record: (
+                *article_sort_key(record[3].get("scp", record[2])),
+                *article_source_sort_key(record[1]),
+                str(record[2]).casefold(),
+            )
+        )
+        path, key, _, _ = variant_articles[0]
+        partial_indexes.append(
+            process_json_file(
+                path,
+                key,
+                articles_by_link,
+                links_by_id,
+                titles_by_reference,
+                article_progress=report_article_progress,
+                download_media=download_media,
+                article_ids=[],
+                additional_articles=variant_articles,
+            )
+        )
+
+    return downloaded_files, changed_files, partial_indexes, processed_filenames
 
 
-def main(download_media=False):
+def update_archive(download_media=False):
     ensure_folder(BASE_FOLDER)
     ensure_folder(JSON_FOLDER)
     ensure_folder(HTML_FOLDER)
@@ -755,24 +1056,34 @@ def main(download_media=False):
             previous_index = None
     except (OSError, json.JSONDecodeError):
         previous_index = None
+    previous_entries_by_source = index_entries_by_source(previous_index)
     force_process_by_file = {
-        filename: source_needs_processing(previous_index, filename)
+        filename: source_needs_processing(
+            previous_index, filename, previous_entries_by_source
+        )
         for filename in content_index.values()
     }
 
     proposal_results = []
 
     def download_proposals():
-        proposal_results.append(
-            update_scp_001_json(
-                force_process=source_needs_processing(
-                    previous_index, "content_scp-001.json"
-                ),
+        result = update_scp_001_json(
+            force_process=source_needs_processing(
+                previous_index,
+                "content_scp-001.json",
+                previous_entries_by_source,
             )
         )
+        proposal_results.append(result)
+        return result
 
     try:
-        downloaded_files, changed_files, partial_indexes = download_and_process_files(
+        (
+            downloaded_files,
+            changed_files,
+            partial_indexes,
+            processed_filenames,
+        ) = download_and_process_files(
             [
                 (filename, force_process_by_file[filename])
                 for filename in content_index.values()
@@ -787,8 +1098,9 @@ def main(download_media=False):
         return 1
     scp_001_path, scp_001_changed = proposal_results[0]
     scp_001_file = (scp_001_path, "scp-001")
-    downloaded_files.append(scp_001_file)
-    if scp_001_changed:
+    if scp_001_file not in downloaded_files:
+        downloaded_files.append(scp_001_file)
+    if scp_001_changed and "content_scp-001.json" not in processed_filenames:
         current_files = [
             (os.path.join(JSON_FOLDER, source_filename), source_key)
             for source_filename, source_key in file_to_key.items()
@@ -860,4 +1172,4 @@ if __name__ == "__main__":
         action="store_true",
         help="download article images during the update",
     )
-    raise SystemExit(main(download_media=parser.parse_args().media))
+    raise SystemExit(update_archive(download_media=parser.parse_args().media))
