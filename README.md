@@ -53,7 +53,7 @@ A Textual TUI with a retro terminal look (dark background, green text, and keybo
 | `help` | Shows the help message |
 | `exit` / `quit` | Closes the TUI |
 
-The Terminal tab keeps command history and clickable article lists. Clicking a series or article echoes and runs the equivalent command in the terminal (for example, `list joke` or `scp-012`). The SCP-001 index is listed in Series 1; individual proposals remain archived but are omitted from the series overview. Opened articles appear in separate tabs; switch back to Terminal without losing its history. Reopening an article selects its existing tab. Press `Ctrl+C` to close the active article tab; from the Terminal tab, `Ctrl+C` quits the TUI. Images and the original HTML layout are not rendered in the terminal.
+The Terminal tab keeps command history and clickable article lists. Clicking a series or article echoes and runs the equivalent command in the terminal (for example, `list joke` or `scp-012`). Long series lists and article text are rendered in small batches so the interface remains responsive. Entering a number shared by multiple article variants opens a chooser, with the regular-series article selected by default. The SCP-001 index is listed in Series 1; individual proposals remain archived but are omitted from the series overview. Opened articles appear in separate tabs; switch back to Terminal without losing its history. Reopening an article selects its existing tab. Press `Ctrl+C` to close the active article tab; from the Terminal tab, `Ctrl+C` quits the TUI. Images and the original HTML layout are not rendered in the terminal.
 
 ---
 

@@ -8,17 +8,20 @@ from urllib.parse import quote, unquote, urlparse
 from bs4 import BeautifulSoup
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import VerticalScroll
+from textual.containers import Vertical, VerticalScroll
+from textual.screen import ModalScreen
 from textual.widgets import (
     Footer,
     Header,
     Input,
     Markdown,
+    OptionList,
     ProgressBar,
     Static,
     TabPane,
     TabbedContent,
 )
+from textual.widgets.option_list import Option
 
 DATA_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scp_data")
 INDEX_PATH = os.path.join(DATA_FOLDER, "index.json")
@@ -179,6 +182,60 @@ def series_sort_key(folder):
     return (1, float("inf"), series_title(folder).casefold())
 
 
+class ArticleChoiceScreen(ModalScreen[str]):
+    BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
+
+    CSS = """
+    ArticleChoiceScreen {
+        align: center middle;
+    }
+    #article-choice-dialog {
+        width: 70%;
+        max-width: 90;
+        height: auto;
+        max-height: 80%;
+        padding: 1 2;
+        border: round #33ff33;
+        background: #050805;
+    }
+    #article-choice-title {
+        height: auto;
+        margin-bottom: 1;
+    }
+    #article-choice-options {
+        height: auto;
+        max-height: 16;
+    }
+    """
+
+    def __init__(self, choices):
+        super().__init__()
+        self.choices = choices
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="article-choice-dialog"):
+            yield Static(
+                "¿A cuál artículo te refieres? (Enter para abrir, Esc para cancelar)",
+                id="article-choice-title",
+            )
+            yield OptionList(
+                *[
+                    Option(
+                        f"{article_id} - {title} [{series_title(folder)}]",
+                        id=identity,
+                    )
+                    for article_id, title, folder, identity in self.choices
+                ],
+                id="article-choice-options",
+            )
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected):
+        self.dismiss(event.option.id)
+
+
 class SCPReader(App):
     TITLE = "SCP Terminal"
     SUB_TITLE = "SCP-OS"
@@ -251,7 +308,9 @@ class SCPReader(App):
         self.query_one("#update-status", Static).display = False
         self.query_one("#update-progress", ProgressBar).display = False
         if not os.path.exists(INDEX_PATH):
-            await self.update_archive()
+            self.write_output(
+                "Welcome to the SCP. Type 'help' to get started."
+            )
         elif self.index is not None:
             self.write_output(
                 f"Welcome to the SCP. {len(self.index)} articles indexed. "
@@ -260,6 +319,16 @@ class SCPReader(App):
         if self.index_error:
             self.write_output(f"[index.json] Error: {self.index_error}")
         self.query_one("#command", CommandInput).focus()
+        if not os.path.exists(INDEX_PATH):
+            self.call_after_refresh(self.startup_update)
+
+    def startup_update(self):
+        self.prepare_command("update")
+        self.run_worker(
+            self.handle_command("update"),
+            name="startup-update",
+            group="archive-update",
+        )
 
     def load_index(self):
         if not os.path.exists(INDEX_PATH):
@@ -276,7 +345,21 @@ class SCPReader(App):
         output.mount(Static(text, markup=False))
         output.scroll_end(animate=False)
 
-    def list_scps(self, requested_series=None):
+    async def mount_markdown_incrementally(
+        self, container, text, classes=None, lines_per_batch=25
+    ):
+        lines = text.splitlines()
+        for start in range(0, len(lines), lines_per_batch):
+            markdown = Markdown(
+                "\n".join(lines[start:start + lines_per_batch]),
+                open_links=False,
+                classes=classes,
+            )
+            await container.mount(markdown)
+            container.scroll_end(animate=False)
+            await asyncio.sleep(0.01)
+
+    async def list_scps(self, requested_series=None):
         if self.index is not None:
             articles = [
                 (
@@ -336,8 +419,7 @@ class SCPReader(App):
                 f"(scp-series:{quote(series, safe=':/_-')})"
                 for series in ordered_series
             ]
-            output.mount(Markdown("\n".join(series_lines), open_links=False))
-            output.scroll_end(animate=False)
+            await self.mount_markdown_incrementally(output, "\n".join(series_lines))
             return
 
         requested_key = requested_series.casefold()
@@ -356,19 +438,48 @@ class SCPReader(App):
             )
             return
 
-        article_lines = []
+        article_lines = [
+            f"## {series_title(series)} ({len(grouped_articles[series])} articles)",
+            "",
+        ]
         for article_id, title, identity in grouped_articles[series]:
             label = title.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
             article_lines.append(
                 f"- {article_id} - "
                 f"[{label}](scp-article:{quote(identity, safe=':/_-')})"
             )
-        markdown = (
-            f"## {series_title(series)} ({len(article_lines)} articles)\n\n"
-            + "\n".join(article_lines)
+        await self.mount_markdown_incrementally(output, "\r".join(article_lines))
+
+    def article_choices(self, number):
+        if self.index is None:
+            return []
+        choices_by_id = {}
+        for identity, metadata in self.index.items():
+            article_id = metadata.get("scp_id", identity)
+            match = re.fullmatch(r"SCP-(\d+)(.*)", article_id, re.IGNORECASE)
+            if not match or int(match.group(1)) != number:
+                continue
+            folder = metadata.get("folder", "misc")
+            choice = (
+                article_id,
+                metadata.get("title") or article_id,
+                folder,
+                identity,
+            )
+            key = article_id.casefold()
+            existing = choices_by_id.get(key)
+            if existing is None or (
+                not folder.casefold().startswith("series-"),
+                folder.casefold(),
+            ) < (
+                not existing[2].casefold().startswith("series-"),
+                existing[2].casefold(),
+            ):
+                choices_by_id[key] = choice
+        return sorted(
+            choices_by_id.values(),
+            key=lambda choice: scp_sort_key(choice[0]),
         )
-        output.mount(Markdown(markdown, open_links=False))
-        output.scroll_end(animate=False)
 
     def resolve_article_identity(self, reference):
         if self.index is not None:
@@ -381,7 +492,13 @@ class SCPReader(App):
                     return identity
         return reference.upper()
 
-    def find_article(self, reference):
+    def find_article(self, reference, errors=None):
+        def report_error(message):
+            if errors is None:
+                self.write_output(message)
+            else:
+                errors.append(message)
+
         identity = self.resolve_article_identity(reference)
         article_id = identity
         if self.index is not None:
@@ -402,7 +519,7 @@ class SCPReader(App):
                             file.read(), article_reference_map(self.index)
                         )
                 except OSError as error:
-                    self.write_output(f"Error reading {html_path}: {error}")
+                    report_error(f"Error reading {html_path}: {error}")
                     return None
 
             json_path = os.path.join(JSON_FOLDER, meta["json_file"])
@@ -410,7 +527,7 @@ class SCPReader(App):
                 with open(json_path, encoding="utf-8") as file:
                     entry = json.load(file)[meta.get("json_key", article_id)]
             except (OSError, json.JSONDecodeError, KeyError) as error:
-                self.write_output(f"Error reading {meta['json_file']}: {error}")
+                report_error(f"Error reading {meta['json_file']}: {error}")
                 return None
             html = entry.get("raw_content") or entry.get("raw_source", "")
             return meta["title"], html_to_text(
@@ -442,51 +559,64 @@ class SCPReader(App):
                         title = entry.get("title") or entry.get("link") or article_id
                         return title, html_to_text(html)
                 except (OSError, json.JSONDecodeError) as error:
-                    self.write_output(f"[{filename}] Error: {error}")
+                    report_error(f"[{filename}] Error: {error}")
         return None
 
     async def show_scp(self, reference):
         identity = self.resolve_article_identity(reference)
-        article = self.find_article(identity)
-        if article is None:
-            self.write_output("SCP article not found.")
-            return
-        title, body = article
         tabs = self.query_one("#workspace-tabs", TabbedContent)
         pane_id = self.article_pane_ids.get(identity)
-        if pane_id is None:
-            pane_id = f"article-{len(self.article_pane_ids) + 1}"
-            article_id = (
-                self.index.get(identity, {}).get("scp_id", identity)
-                if self.index is not None
-                else identity
-            )
-            article_view = VerticalScroll(
-                Static(
-                    f"{article_id} - {title}",
-                    classes="article-body",
-                    markup=False,
-                ),
-                Markdown(body, open_links=False, classes="article-body"),
-                classes="article-scroll",
-            )
-            await tabs.add_pane(TabPane(title, article_view, id=pane_id))
-            self.article_pane_ids[identity] = pane_id
+        if pane_id is not None:
+            self.set_focus(None)
+            tabs.active = pane_id
+            return
+
+        errors = []
+        article = await asyncio.to_thread(self.find_article, identity, errors)
+        for error in errors:
+            self.write_output(error)
+        if article is None:
+            if not errors:
+                self.write_output("SCP article not found.")
+            return
+        title, body = article
+        pane_id = f"article-{len(self.article_pane_ids) + 1}"
+        article_id = (
+            self.index.get(identity, {}).get("scp_id", identity)
+            if self.index is not None
+            else identity
+        )
+        article_view = VerticalScroll(
+            Static(
+                f"{article_id} - {title}",
+                classes="article-body",
+                markup=False,
+            ),
+            classes="article-scroll",
+        )
+        await tabs.add_pane(TabPane(title, article_view, id=pane_id))
+        self.article_pane_ids[identity] = pane_id
         self.set_focus(None)
         tabs.active = pane_id
+        await self.mount_markdown_incrementally(
+            article_view, body, classes="article-body"
+        )
 
     async def on_input_submitted(self, event: Input.Submitted):
         command = event.value.strip()
         await self.execute_command(command, event.input)
 
     async def execute_command(self, command, command_input=None):
+        self.prepare_command(command, command_input)
+        await self.handle_command(command)
+
+    def prepare_command(self, command, command_input=None):
         if command_input is None:
             command_input = self.query_one("#command", CommandInput)
         command_input.value = ""
         command_input.remember(command)
         if command:
             self.write_output(f"> {command}")
-        await self.handle_command(command)
 
     async def handle_command(self, command):
         normalized = command.lower()
@@ -509,21 +639,38 @@ class SCPReader(App):
                 "Press Ctrl+C to close an article tab or quit from Terminal."
             )
         elif normalized == "list":
-            self.list_scps()
+            await self.list_scps()
         elif normalized.startswith("list "):
-            self.list_scps(command[5:].strip())
+            await self.list_scps(command[5:].strip())
         elif normalized == "update":
             await self.update_archive()
         elif command.upper().startswith("SCP-"):
             await self.show_scp(command)
         elif command.isdigit() and 1 <= int(command) <= 9999:
-            await self.show_scp(f"SCP-{int(command):03}")
+            choices = self.article_choices(int(command))
+            if len(choices) > 1:
+                self.push_screen(
+                    ArticleChoiceScreen(choices),
+                    callback=self.on_article_choice,
+                )
+            elif choices:
+                await self.show_scp(choices[0][3])
+            else:
+                await self.show_scp(f"SCP-{int(command):03}")
         elif self.index is not None and normalize_article_reference(command) in {
             normalize_article_reference(identity) for identity in self.index
         }:
             await self.show_scp(command)
         elif command:
             self.write_output("Unknown command. Type 'help'.")
+
+    def on_article_choice(self, identity):
+        if identity:
+            self.run_worker(
+                self.show_scp(identity),
+                name=f"open-{identity}",
+                group="open-article",
+            )
 
     async def update_archive(self):
         loader_path = os.path.join(os.path.dirname(__file__), "scp_loader.py")
