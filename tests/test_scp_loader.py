@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import requests
 from textual.containers import VerticalScroll
-from textual.widgets import Input, Markdown, OptionList, TabbedContent
+from textual.widgets import Collapsible, Input, Markdown, OptionList, TabbedContent
 
 from scp_loader import (
     BASE_JSON_URL,
@@ -32,7 +32,9 @@ from scp_loader import (
 from scp_reader import (
     CommandInput,
     SCPReader,
+    CollapsibleSection,
     article_reference_map,
+    html_to_article_blocks,
     html_to_text,
 )
 
@@ -575,6 +577,56 @@ class ReaderReferenceTests(unittest.TestCase):
         self.assertIn("(scp-article:SCP-002)", text)
 
 
+class CollapsibleArticleTests(unittest.TestCase):
+    def test_converts_nested_sections_and_keeps_internal_article_links(self):
+        index = {
+            "scp-002": {
+                "scp_id": "SCP-002",
+                "html_file": "scp-002.html",
+            }
+        }
+        html = """
+        <div id="page-content">
+          <p>Intro</p>
+          <div class="collapsible-block">
+            <div class="collapsible-block-folded">
+              <a class="collapsible-block-link" href="javascript:;">+ Interview A</a>
+            </div>
+            <div class="collapsible-block-unfolded" style="display:none">
+              <div class="collapsible-block-content">
+                <p>See <a href="../series-1/scp-002.html">SCP-002</a>.</p>
+                <div class="collapsible-block">
+                  <div class="collapsible-block-folded">
+                    <a class="collapsible-block-link" href="javascript:;">+ Nested file</a>
+                  </div>
+                  <div class="collapsible-block-unfolded">
+                    <div class="collapsible-block-content"><p>Nested text.</p></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <p>Outro</p>
+        </div>
+        """
+
+        blocks = html_to_article_blocks(html, article_reference_map(index))
+
+        self.assertEqual(len(blocks), 3)
+        self.assertIn("Intro", blocks[0])
+        self.assertIsInstance(blocks[1], CollapsibleSection)
+        self.assertEqual(blocks[1].title, "Interview A")
+        self.assertIn("(scp-article:scp-002)", blocks[1].content[0])
+        nested = next(
+            block
+            for block in blocks[1].content
+            if isinstance(block, CollapsibleSection)
+        )
+        self.assertEqual(nested.title, "Nested file")
+        self.assertIn("Nested text", nested.content[0])
+        self.assertIn("Outro", blocks[2])
+
+
 class ReaderListTests(unittest.IsolatedAsyncioTestCase):
     async def test_list_shows_series_counts_and_id_before_titles(self):
         index = {
@@ -807,6 +859,54 @@ class ReaderListTests(unittest.IsolatedAsyncioTestCase):
                     rendered = "\n".join(widget._markdown for widget in article_lines)
                     self.assertIn("Article line 0", rendered)
                     self.assertIn("Article line 59", rendered)
+
+    async def test_article_collapsible_is_interactive_and_closed_by_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            html_directory = Path(directory) / "html" / "series-1"
+            html_directory.mkdir(parents=True)
+            (html_directory / "scp-003.html").write_text(
+                """
+                <p>Visible text.</p>
+                <div class="collapsible-block">
+                  <div class="collapsible-block-folded">
+                    <a class="collapsible-block-link" href="javascript:;">+ Access file</a>
+                  </div>
+                  <div class="collapsible-block-unfolded" style="display:none">
+                    <div class="collapsible-block-content"><p>Hidden report.</p></div>
+                  </div>
+                </div>
+                """,
+                encoding="utf-8",
+            )
+            with (
+                patch("scp_reader.INDEX_PATH", str(Path(directory) / "index.json")),
+                patch("scp_reader.HTML_EXPORT_FOLDER", str(Path(directory) / "html")),
+                patch.object(SCPReader, "update_archive", new_callable=AsyncMock),
+            ):
+                reader = SCPReader()
+                reader.index = {
+                    "scp-003": {
+                        "scp_id": "SCP-003",
+                        "title": "Biological Motherboard",
+                        "folder": "series-1",
+                        "html_file": "scp-003.html",
+                    }
+                }
+                async with reader.run_test() as pilot:
+                    await reader.show_scp("scp-003")
+                    section = reader.query_one("#article-1 Collapsible", Collapsible)
+
+                    self.assertTrue(section.collapsed)
+                    self.assertEqual(section.title, "Access file")
+                    self.assertIn("Hidden report", section.query_one(Markdown)._markdown)
+                    title = section.query_one("CollapsibleTitle")
+                    title.focus()
+                    await pilot.press("enter")
+                    await pilot.pause()
+                    self.assertFalse(section.collapsed)
+                    await pilot.press("enter")
+                    await pilot.pause()
+                    self.assertTrue(section.collapsed)
 
     async def test_missing_index_starts_archive_update(self):
         with tempfile.TemporaryDirectory() as directory:

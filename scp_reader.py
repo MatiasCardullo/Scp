@@ -3,6 +3,7 @@ import json
 import os
 import re
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from urllib.parse import quote, unquote, urlparse
 
@@ -12,6 +13,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import (
+    Collapsible,
     Footer,
     Header,
     Input,
@@ -29,6 +31,12 @@ INDEX_PATH = os.path.join(DATA_FOLDER, "index.json")
 UPDATE_LOG_PATH = os.path.join(DATA_FOLDER, "update.log")
 HTML_EXPORT_FOLDER = os.path.join(DATA_FOLDER, "html")
 JSON_FOLDER = os.path.join(DATA_FOLDER, "json")
+
+
+@dataclass
+class CollapsibleSection:
+    title: str
+    content: list
 
 
 def normalize_article_reference(reference):
@@ -111,6 +119,71 @@ def html_to_text(html, article_references=None):
             f"[{escaped_label}](scp-article:{quote(identity, safe=':/_-')})",
         )
     return text
+
+
+def html_to_article_blocks(html, article_references=None):
+    """Convert HTML into readable text blocks and nested collapsible sections."""
+
+    def convert_fragment(fragment):
+        soup = BeautifulSoup(fragment, "html.parser")
+        for tag in soup(["script", "style"]):
+            tag.decompose()
+
+        sections = {}
+        collapsible_blocks = [
+            block
+            for block in soup.find_all(class_="collapsible-block")
+            if not block.find_parent(class_="collapsible-block")
+        ]
+        for section_number, block in enumerate(collapsible_blocks):
+            folded = block.select_one(
+                ".collapsible-block-folded .collapsible-block-link"
+            )
+            title = folded.get_text(" ", strip=True) if folded else ""
+            title = re.sub(r"^[+-]\s*|\s*[+-]$", "", title)
+            title = " ".join(title.split())
+
+            content = block.select_one(
+                ".collapsible-block-unfolded .collapsible-block-content"
+            )
+            content_markup = str(content) if content else ""
+            if content is None:
+                content = block.select_one(".collapsible-block-unfolded")
+                if content:
+                    content_copy = BeautifulSoup(str(content), "html.parser")
+                    for control in content_copy.select(
+                        ".collapsible-block-unfolded-link"
+                    ):
+                        control.decompose()
+                    content_markup = str(content_copy)
+            section_content = convert_fragment(content_markup) if content_markup else []
+            token = f"SCPSECTIONTOKEN{section_number}END"
+            sections[token] = CollapsibleSection(
+                title or "Show section",
+                section_content,
+            )
+            block.replace_with(token)
+
+        text = html_to_text(str(soup), article_references)
+        if not sections:
+            return [text] if text else []
+
+        blocks = []
+        position = 0
+        for match in re.finditer(r"SCPSECTIONTOKEN(\d+)END", text):
+            preceding_text = text[position:match.start()].strip()
+            if preceding_text:
+                blocks.append(preceding_text)
+            token = f"SCPSECTIONTOKEN{match.group(1)}END"
+            blocks.append(sections[token])
+            position = match.end()
+
+        trailing_text = text[position:].strip()
+        if trailing_text:
+            blocks.append(trailing_text)
+        return blocks
+
+    return convert_fragment(html)
 
 
 class CommandInput(Input):
@@ -301,6 +374,12 @@ class SCPReader(App):
     .article-body {
         color: #b6ffb6;
     }
+    .article-collapsible {
+        width: 1fr;
+        height: auto;
+        margin: 1 0;
+        border: round #1f7a1f;
+    }
     CommandInput {
         margin: 0 1 1 1;
         border: round #1f7a1f;
@@ -409,6 +488,57 @@ class SCPReader(App):
             await container.mount(markdown)
             container.scroll_end(animate=False)
             await asyncio.sleep(0.01)
+
+    def article_markdown_widgets(self, text, classes=None, lines_per_batch=25):
+        lines = text.splitlines()
+        return [
+            Markdown(
+                "\n".join(lines[start:start + lines_per_batch]),
+                open_links=False,
+                classes=classes,
+            )
+            for start in range(0, len(lines), lines_per_batch)
+        ]
+
+    def collapsible_widget(self, section, classes=None, lines_per_batch=25):
+        children = []
+        for block in section.content:
+            if isinstance(block, CollapsibleSection):
+                children.append(
+                    self.collapsible_widget(block, classes, lines_per_batch)
+                )
+            else:
+                children.extend(
+                    self.article_markdown_widgets(
+                        block,
+                        classes=classes,
+                        lines_per_batch=lines_per_batch,
+                    )
+                )
+        return Collapsible(
+            *children,
+            title=section.title,
+            collapsed=True,
+            classes="article-collapsible",
+        )
+
+    async def mount_article_blocks_incrementally(
+        self, container, blocks, classes=None, lines_per_batch=25
+    ):
+        for block in blocks:
+            if isinstance(block, CollapsibleSection):
+                await container.mount(
+                    self.collapsible_widget(block, classes, lines_per_batch)
+                )
+                container.scroll_end(animate=False)
+                await asyncio.sleep(0.01)
+            else:
+                await self.mount_markdown_incrementally(
+                    container,
+                    block,
+                    classes=classes,
+                    lines_per_batch=lines_per_batch,
+                )
 
     async def list_scps(self, requested_series=None):
         if self.index is not None:
@@ -543,12 +673,18 @@ class SCPReader(App):
                     return identity
         return reference.upper()
 
-    def find_article(self, reference, errors=None):
+    def find_article(self, reference, errors=None, with_collapsibles=False):
         def report_error(message):
             if errors is None:
                 self.write_output(message)
             else:
                 errors.append(message)
+
+        def convert_html(html):
+            references = article_reference_map(self.index) if self.index else None
+            if with_collapsibles:
+                return html_to_article_blocks(html, references)
+            return html_to_text(html, references)
 
         identity = self.resolve_article_identity(reference)
         article_id = identity
@@ -566,9 +702,7 @@ class SCPReader(App):
             if os.path.exists(html_path):
                 try:
                     with open(html_path, encoding="utf-8") as file:
-                        return meta["title"], html_to_text(
-                            file.read(), article_reference_map(self.index)
-                        )
+                        return meta["title"], convert_html(file.read())
                 except OSError as error:
                     report_error(f"Error reading {html_path}: {error}")
                     return None
@@ -581,9 +715,7 @@ class SCPReader(App):
                 report_error(f"Error reading {meta['json_file']}: {error}")
                 return None
             html = entry.get("raw_content") or entry.get("raw_source", "")
-            return meta["title"], html_to_text(
-                html, article_reference_map(self.index)
-            )
+            return meta["title"], convert_html(html)
 
         article_id = identity
         for root, _, files in os.walk(DATA_FOLDER):
@@ -608,7 +740,7 @@ class SCPReader(App):
                         article_id, entry = article_match
                         html = entry.get("raw_content") or entry.get("raw_source", "")
                         title = entry.get("title") or entry.get("link") or article_id
-                        return title, html_to_text(html)
+                        return title, convert_html(html)
                 except (OSError, json.JSONDecodeError) as error:
                     report_error(f"[{filename}] Error: {error}")
         return None
@@ -623,7 +755,9 @@ class SCPReader(App):
             return
 
         errors = []
-        article = await asyncio.to_thread(self.find_article, identity, errors)
+        article = await asyncio.to_thread(
+            self.find_article, identity, errors, True
+        )
         for error in errors:
             self.write_output(error)
         if article is None:
@@ -649,7 +783,7 @@ class SCPReader(App):
         self.article_pane_ids[identity] = pane_id
         self.set_focus(None)
         tabs.active = pane_id
-        await self.mount_markdown_incrementally(
+        await self.mount_article_blocks_incrementally(
             article_view, body, classes="article-body"
         )
 
