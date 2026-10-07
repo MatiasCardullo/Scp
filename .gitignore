@@ -1,3 +1,6 @@
 /scp_data
 .vscode/settings.json
 *.pyc
+docs/foundation-context.md
+docs/plan.md
+docs/README.md

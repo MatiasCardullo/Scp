@@ -1,11 +1,12 @@
 # SCP Terminal Archive
 
-A two-part tool for downloading, cataloging, and reading articles from the [Wikidot SCP Foundation](http://www.scpwiki.com/) locally, with a retro terminal-style interface.
+A local SCP archive browser for downloading, cataloging, searching, and reading articles from the [SCP Wiki](https://scp-wiki.wikidot.com/) through one retro terminal-style application.
 
 ```
-📥 scp_loader.py        →  downloads and builds the local archive (JSON + HTML + images)
-🖥️  main.py              →  retro terminal for searching and reading downloaded articles
-⚙️  scp_loader_worker.py →  imports the loader update function for reader subprocesses
+🖥️  main.py              →  starts the application; browse, read, and update the archive here
+📥 scp_reader.py         →  implements the terminal interface and reader behavior
+⚙️  scp_loader.py        →  downloads and builds the local archive (JSON + HTML + images)
+🔄 scp_loader_worker.py  →  runs archive updates separately to keep the interface responsive
 ```
 
 ## Documentation
@@ -22,7 +23,7 @@ A two-part tool for downloading, cataloging, and reading articles from the [Wiki
 Downloads the public dataset from [scp-data.tedivm.com](https://scp-data.tedivm.com/) and creates a browsable local archive:
 
 - Downloads the content index and all article `.json` files (organized by series/folder).
-- Refreshes `content_scp-001.json` from the official SCP-001 index page and each proposal linked from it, so that the local archive includes all current proposals.
+- Refreshes `content_scp-001.json` from the official SCP-001 index page and its linked proposals, so the local archive does not rely on the API's SCP-001 group being complete.
 - Parses each article's HTML with BeautifulSoup.
 - Uses each record's API `link` value as its local article identity and builds canonical `https://scp-wiki.wikidot.com/` URLs from it; raw downloaded API JSON is left unchanged.
 - Reads complete SCP titles from the official main-series listing pages 1–10, matching articles by their SCP identifier.
@@ -43,7 +44,7 @@ The generated `scp_data/index.json` is keyed by the API `link` values. Each entr
 
 The loader exposes `update_archive(download_media=False)` for import-based use. The reader starts `scp_loader_worker.py` as a subprocess; the worker imports this function so updates remain isolated from the UI while streaming progress.
 
-SCP-001 pages are read from their rendered Wikidot HTML because the dataset API only includes one proposal. Their records use the same JSON fields as the API articles; unavailable source markup and revision history are left empty.
+SCP-001 pages are read from their rendered Wikidot HTML so the local archive can include every proposal linked from the official index. Their records use the same JSON fields as the API articles; unavailable source markup and revision history are left empty.
 
 If a series listing has no title for an article, the loader keeps the API title without reporting each missing title.
 

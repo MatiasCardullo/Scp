@@ -23,9 +23,9 @@ Downloads and prepares the local archive:
 4. Builds `scp_data/index.json` and generates a local HTML file for each
    article from `raw_content` (or `raw_source` if `raw_content` is missing).
    The generated HTML links to other articles available locally.
-5. Updates SCP-001 records by reading the official index and its proposals
-   from Wikidot, because those proposals are not taken from the regular API
-   index.
+5. Rebuilds the SCP-001 records from the official index and its linked
+   proposals on Wikidot, rather than relying on the API's SCP-001 group being
+   complete.
 6. If media downloads are enabled, downloads images and makes the local HTML
    use them. Images are not downloaded otherwise.
 
