@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import re
@@ -457,6 +458,7 @@ def process_json_file(
     links_by_id,
     titles_by_reference,
     article_progress=None,
+    download_media=False,
 ):
     """Process a series JSON file: generate HTML for each article (with links
     between SCPs, local images, and no self-references) and return its partial
@@ -511,12 +513,13 @@ def process_json_file(
         for box in soup.find_all("div", class_="licensebox"):
             box.decompose()
 
-        # --- Images: resolve the real URL (parent <a> or filename match). ---
-        url_map = build_image_url_map(soup)
-        for img in soup.find_all("img"):
-            real_url = resolve_image_url(img, url_map)
-            if real_url:
-                img["src"] = enqueue_image(real_url)
+        if download_media:
+            # --- Images: resolve the real URL (parent <a> or filename match). ---
+            url_map = build_image_url_map(soup)
+            for img in soup.find_all("img"):
+                real_url = resolve_image_url(img, url_map)
+                if real_url:
+                    img["src"] = enqueue_image(real_url)
 
         # --- Existing links to other SCPs. ---
         for a in soup.find_all("a", href=True):
@@ -638,6 +641,7 @@ def download_and_process_files(
     file_to_key,
     titles_by_reference,
     on_downloads_complete=None,
+    download_media=False,
 ):
     downloaded_files = []
     changed_files = []
@@ -698,6 +702,7 @@ def download_and_process_files(
                                 dict(links_by_id),
                                 titles_by_reference,
                                 article_progress=emit_article_progress,
+                                download_media=download_media,
                             )
                             process_futures[process_future] = (path, key)
                             changed_files.append((path, key))
@@ -721,7 +726,7 @@ def download_and_process_files(
     return downloaded_files, changed_files, partial_indexes
 
 
-def main():
+def main(download_media=False):
     ensure_folder(BASE_FOLDER)
     ensure_folder(JSON_FOLDER)
     ensure_folder(HTML_FOLDER)
@@ -775,6 +780,7 @@ def main():
             file_to_key,
             titles_by_reference,
             on_downloads_complete=download_proposals,
+            download_media=download_media,
         )
     except (requests.RequestException, ValueError, OSError) as error:
         emit_output(f"Error downloading SCP-001 proposals: {error}")
@@ -798,12 +804,14 @@ def main():
                 links_by_id,
                 titles_by_reference,
                 article_progress=emit_article_progress,
+                download_media=download_media,
             )
         )
         changed_files.append(scp_001_file)
 
     json_files = list(dict.fromkeys(downloaded_files))
-    queue_missing_images(json_files)
+    if download_media:
+        queue_missing_images(json_files)
 
     articles_by_link, links_by_id = build_article_index(json_files)
     emit_output(f"Found {len(articles_by_link)} API links.")
@@ -831,16 +839,25 @@ def main():
         emit_output(f"Error saving index: {e}")
         return 1
 
-    emit_output(f"Downloading images ({len(download_queue)} files)...", flush=True)
-    run_parallel(
-        list(download_queue),
-        download_image,
-        "Downloading images",
-    )
+    if download_media:
+        emit_output(f"Downloading images ({len(download_queue)} files)...", flush=True)
+        run_parallel(
+            list(download_queue),
+            download_image,
+            "Downloading images",
+        )
+    else:
+        emit_output("Skipping image downloads (use --media to include them).")
 
     emit_output("All articles and resources have been processed.")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    parser = argparse.ArgumentParser(description="Update the local SCP archive.")
+    parser.add_argument(
+        "--media",
+        action="store_true",
+        help="download article images during the update",
+    )
+    raise SystemExit(main(download_media=parser.parse_args().media))

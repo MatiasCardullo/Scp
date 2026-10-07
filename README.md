@@ -20,7 +20,7 @@ Downloads the public dataset from [scp-data.tedivm.com](https://scp-data.tedivm.
 - Uses each record's API `link` value as its local article identity and builds canonical `https://scp-wiki.wikidot.com/` URLs from it; raw downloaded API JSON is left unchanged.
 - Reads complete SCP titles from the official main-series listing pages 1–10, matching articles by their SCP identifier.
 - Replaces `SCP-###` references with internal links to the corresponding article.
-- Downloads referenced images in parallel (4 workers) and saves them locally, updating their `src` attributes.
+- With `--media`, downloads referenced images in parallel (4 workers) and saves them locally, updating their `src` attributes. Image downloads are skipped by default.
 - Saves everything under `scp_data/` using this structure:
 
 ```
@@ -48,7 +48,8 @@ A Textual TUI with a retro terminal look (dark background, green text, and keybo
 | `SCP-173` or `173` | Opens an article in its own scrollable tab |
 | `list` | Shows clickable series titles and article counts |
 | `list <series>` | Shows that series' article IDs and clickable titles, one per line |
-| `update` | Runs `scp_loader.py`, shows live download and processing progress, and reloads the article index when it finishes |
+| `update` | Runs `scp_loader.py` without downloading images, shows live progress, and reloads the article index when it finishes |
+| `update --media` | Also downloads article images during the update |
 | `cls` | Clears the terminal history |
 | `help` | Shows the help message |
 | `exit` / `quit` | Closes the TUI |
@@ -70,11 +71,12 @@ pip install -r requirements.txt
 python main.py
 ```
 
+Run the loader directly with `python scp_loader.py --media` to include image downloads.
 
 ---
 
 ## Current notes / limitations
 
-- Image downloads retry temporary network, rate-limit, and server errors; permanently unavailable images are logged and retried on a later update.
+- Image downloads are opt-in with `update --media` (or `python scp_loader.py --media`); they retry temporary network, rate-limit, and server errors, and permanently unavailable images are logged and retried on a later media update.
 - If `scp_data/index.json` is missing, the reader automatically runs the loader when it starts.
 - The loader stores internal SCP references in article HTML; the reader makes references to locally indexed articles clickable.

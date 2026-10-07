@@ -682,7 +682,7 @@ class SCPReader(App):
                 "  ###      - open an article by number\n"
                 "  list     - show series titles and article counts\n"
                 "  list <series> - show article IDs and titles in a series\n"
-                "  update   - run the loader and refresh the archive index\n"
+                "  update [--media] - refresh the archive; --media downloads images\n"
                 "  cls      - clear the terminal history\n"
                 "  help     - show this help\n"
                 "  exit     - quit\n\n"
@@ -695,6 +695,8 @@ class SCPReader(App):
             await self.list_scps(command[5:].strip())
         elif normalized == "update":
             await self.update_archive()
+        elif normalized == "update --media":
+            await self.update_archive(download_media=True)
         elif command.upper().startswith("SCP-"):
             await self.show_scp(command)
         elif command.isdigit() and 1 <= int(command) <= 9999:
@@ -723,7 +725,7 @@ class SCPReader(App):
                 group="open-article",
             )
 
-    async def update_archive(self):
+    async def update_archive(self, download_media=False):
         loader_path = os.path.join(os.path.dirname(__file__), "scp_loader.py")
         self.write_output("Starting SCP archive update...")
         log_file = None
@@ -760,10 +762,11 @@ class SCPReader(App):
         download_progress.update(progress=0)
         process_progress.update(progress=0)
         try:
+            command = [sys.executable, "-u", loader_path]
+            if download_media:
+                command.append("--media")
             process = await asyncio.create_subprocess_exec(
-                sys.executable,
-                "-u",
-                loader_path,
+                *command,
                 cwd=os.path.dirname(__file__),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
