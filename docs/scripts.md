@@ -17,8 +17,11 @@ Downloads and prepares the local archive:
 1. Fetches `content_index.json` from
    `https://scp-data.tedivm.com/data/scp/items/` to determine which data files
    to download and which series or group each file belongs to.
-2. Downloads the series and special-group JSON files. It compares them with
-   existing files and avoids reprocessing unchanged content.
+2. Downloads the series and special-group JSON files into `data/api/`. It
+   sends saved `ETag` and `Last-Modified` validators with conditional requests,
+   so unchanged files return `304 Not Modified` without transferring their
+   contents. If the server does not provide validators, it falls back to
+   comparing the downloaded JSON with the local copy.
 3. Fetches the official series pages to fill in article titles.
 4. Builds `data/index.json` and generates a local HTML file for each
    article from `raw_content` (or `raw_source` if `raw_content` is missing).
@@ -28,6 +31,10 @@ Downloads and prepares the local archive:
    complete.
 6. If media downloads are enabled, downloads images and makes the local HTML
    use them. Images are not downloaded otherwise.
+
+The article-processing progress uses fixed series milestones: each full series
+advances the bar by 10 percentage points (half-series by 5), instead of
+recalculating its total as new JSON files are downloaded.
 
 It also exposes `update_archive(download_media=False)` for use by other
 modules. When run directly, it supports:
@@ -64,6 +71,6 @@ index does not exist at startup, the reader begins an update.
 
 ## Tests
 
-`tests/test_scp_loader.py` contains tests for loader functions and reader
-behavior, including reference normalization, series titles, SCP-001, and
-collapsible sections.
+`tests/loader.py` contains tests for loader functions and reader behavior.
+`tests/test_api_json_storage.py` verifies API validators and fixed
+series-based processing progress.

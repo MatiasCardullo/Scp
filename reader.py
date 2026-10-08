@@ -30,7 +30,6 @@ DATA_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 INDEX_PATH = os.path.join(DATA_FOLDER, "index.json")
 UPDATE_LOG_PATH = os.path.join(DATA_FOLDER, "update.log")
 HTML_EXPORT_FOLDER = os.path.join(DATA_FOLDER, "html")
-JSON_FOLDER = os.path.join(DATA_FOLDER, "json")
 
 
 @dataclass
@@ -705,12 +704,13 @@ class SCPReader(App):
                     report_error(f"Error reading {html_path}: {error}")
                     return None
 
-            json_path = os.path.join(JSON_FOLDER, meta["json_file"])
+            json_file = meta["json_file"]
+            json_path = os.path.join(DATA_FOLDER, json_file)
             try:
                 with open(json_path, encoding="utf-8") as file:
                     entry = json.load(file)[meta.get("json_key", article_id)]
             except (OSError, json.JSONDecodeError, KeyError) as error:
-                report_error(f"Error reading {meta['json_file']}: {error}")
+                report_error(f"Error reading {json_file}: {error}")
                 return None
             html = entry.get("raw_content") or entry.get("raw_source", "")
             return meta["title"], convert_html(html)
@@ -1012,7 +1012,11 @@ class SCPReader(App):
         if stage == "Processing articles":
             status = self.query_one("#process-status", Static)
             progress = self.query_one("#process-progress", ProgressBar)
-            status.update(f"{stage}: {completed}/{total}")
+            status.update(
+                f"{stage}: {completed}%"
+                if total == 100
+                else f"{stage}: {completed}/{total}"
+            )
         else:
             status = self.query_one("#download-status", Static)
             progress = self.query_one("#download-progress", ProgressBar)

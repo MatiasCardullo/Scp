@@ -33,7 +33,8 @@ Downloads the public dataset from [scp-data.tedivm.com](https://scp-data.tedivm.
 
 ```
 data/
-├── json/       # Original downloaded JSON files
+├── api/        # Original JSON files downloaded from the API
+├── json/       # Locally generated JSON files, including SCP-001
 ├── html/       # Processed HTML, organized by series
 │   └── series-1/
 │       └── scp-173.html

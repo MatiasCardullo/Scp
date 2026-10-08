@@ -10,6 +10,7 @@ from threading import Lock
 from urllib.parse import quote, urljoin, urlparse
 
 BASE_FOLDER = "data"
+API_FOLDER = os.path.join(BASE_FOLDER, "api")
 JSON_FOLDER = os.path.join(BASE_FOLDER, "json")
 HTML_FOLDER = os.path.join(BASE_FOLDER, "html")
 IMG_FOLDER = os.path.join(BASE_FOLDER, "images")
@@ -19,8 +20,8 @@ WIKIDOT_BASE_URL = "https://scp-wiki.wikidot.com/"
 SCP_ID_RE = re.compile(r"^SCP-\d+[\w-]*$", re.IGNORECASE)
 SERIES_LINK_RE = re.compile(r"^/?(SCP-\d+[\w-]*)$", re.IGNORECASE)
 
-MAX_WORKERS = 4  # Number of files processed/downloaded concurrently.
-IMAGE_DOWNLOAD_ATTEMPTS = 3
+MAX_WORKERS = 1  # Number of files processed/downloaded concurrently.
+IMAGE_DOWNLOAD_ATTEMPTS = 10
 IMAGE_REQUEST_HEADERS = {
     "User-Agent": "SCP-Terminal-Archive/1.0 (https://github.com/MatiasCardullo/Scp)"
 }
@@ -39,6 +40,7 @@ output_lock = Lock()
 download_queue = []
 queue_lock = Lock()
 _enqueued_urls = set()
+api_cache_lock = Lock()
 
 
 def emit_output(*args, **kwargs):
@@ -132,16 +134,39 @@ def run_parallel(items, worker_fn, desc):
 
 
 def download_json_file(filename, force_process=False):
-    filepath = os.path.join(JSON_FOLDER, filename)
+    filepath = os.path.join(API_FOLDER, filename)
     url = BASE_JSON_URL + filename
     try:
-        r = requests.get(url, timeout=30)
+        cache = load_api_cache()
+        cached_metadata = cache.get(filename, {})
+        if not isinstance(cached_metadata, dict):
+            cached_metadata = {}
+        headers = {}
+        if os.path.isfile(filepath):
+            if cached_metadata.get("etag"):
+                headers["If-None-Match"] = cached_metadata["etag"]
+            if cached_metadata.get("last_modified"):
+                headers["If-Modified-Since"] = cached_metadata["last_modified"]
+
+        r = requests.get(url, headers=headers, timeout=30)
+        if getattr(r, "status_code", 200) == 304:
+            if os.path.isfile(filepath):
+                return filepath, force_process
+            r = requests.get(url, timeout=30)
         r.raise_for_status()
         remote_data = r.json()
+        response_headers = getattr(r, "headers", {})
+        if response_headers is None:
+            response_headers = {}
         if os.path.exists(filepath):
             try:
                 with open(filepath, encoding="utf-8") as existing_file:
                     if json.load(existing_file) == remote_data:
+                        save_api_cache_entry(
+                            filename,
+                            response_headers.get("ETag"),
+                            response_headers.get("Last-Modified"),
+                        )
                         return filepath, force_process
             except (OSError, json.JSONDecodeError):
                 pass
@@ -150,6 +175,11 @@ def download_json_file(filename, force_process=False):
             with open(temporary_path, "wb") as file:
                 file.write(r.content)
             os.replace(temporary_path, filepath)
+            save_api_cache_entry(
+                filename,
+                response_headers.get("ETag"),
+                response_headers.get("Last-Modified"),
+            )
         finally:
             if os.path.exists(temporary_path):
                 os.remove(temporary_path)
@@ -157,6 +187,46 @@ def download_json_file(filename, force_process=False):
     except Exception as e:
         emit_output(f"Error downloading {filename}: {e}", flush=True)
         return (filepath, False) if os.path.exists(filepath) else None
+
+
+def load_api_cache():
+    cache_path = os.path.join(API_FOLDER, ".http_cache.json")
+    try:
+        with open(cache_path, encoding="utf-8") as file:
+            cache = json.load(file)
+        return cache if isinstance(cache, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as error:
+        emit_output(f"Error reading API cache {cache_path}: {error}", flush=True)
+        return {}
+
+
+def save_api_cache_entry(filename, etag, last_modified):
+    cache_path = os.path.join(API_FOLDER, ".http_cache.json")
+    temporary_path = cache_path + ".tmp"
+    with api_cache_lock:
+        cache = load_api_cache()
+        if etag or last_modified:
+            metadata = {}
+            if etag:
+                metadata["etag"] = etag
+            if last_modified:
+                metadata["last_modified"] = last_modified
+            cache[filename] = metadata
+        elif filename in cache:
+            del cache[filename]
+        else:
+            return
+        try:
+            with open(temporary_path, "w", encoding="utf-8") as file:
+                json.dump(cache, file, ensure_ascii=False)
+            os.replace(temporary_path, cache_path)
+        except OSError as error:
+            emit_output(f"Error saving API cache {cache_path}: {error}", flush=True)
+        finally:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
 
 
 def image_filename_from_url(url):
@@ -652,7 +722,9 @@ def process_json_file(
             "scp_id": article.get("scp_id", article_id),
             "title": title,
             "folder": article["folder"],
-            "json_file": os.path.basename(source_path),
+            "json_file": os.path.relpath(source_path, BASE_FOLDER).replace(
+                os.sep, "/"
+            ),
             "html_file": filename,
         }
         if article_id.casefold() != index_entry["scp_id"].casefold():
@@ -738,11 +810,25 @@ def download_and_process_files(
     downloaded_by_filename = {}
     processed_filenames = set()
     process_completed = 0
-    process_total = 0
+
+    def report_source_progress(source_key, completed, total):
+        nonlocal process_completed
+        match = SERIES_FILE_RE.match(source_key)
+        if not match:
+            return
+        series_number = float(match.group(1))
+        start = max(0, (series_number - 1) * 10)
+        end = min(100, series_number * 10)
+        fraction = min(1, completed / total) if total else 1
+        progress = min(100, int(start + (end - start) * fraction))
+        if progress > process_completed:
+            process_completed = progress
+            emit_progress("Processing articles", process_completed, 100)
+
     cached_files = [
-        (os.path.join(JSON_FOLDER, filename), source_key)
+        (os.path.join(API_FOLDER, filename), source_key)
         for filename, source_key in file_to_key.items()
-        if os.path.isfile(os.path.join(JSON_FOLDER, filename))
+        if os.path.isfile(os.path.join(API_FOLDER, filename))
     ]
     download_jobs = sorted(jobs, key=download_order_key)
     emit_progress("Downloading special groups", 0, len(download_jobs))
@@ -806,9 +892,9 @@ def download_and_process_files(
                     if SERIES_FILE_RE.match(file_to_key[filename])
                 ]
                 completed_results = {}
+                emit_progress("Processing articles", process_completed, 100)
 
                 def process_ready_series(filename):
-                    nonlocal process_completed, process_total
                     source = downloaded_by_filename.get(filename)
                     if source is None:
                         return
@@ -835,23 +921,13 @@ def download_and_process_files(
                     articles_by_link, links_by_id = build_article_index(
                         list(dict.fromkeys(cached_files + available_files))
                     )
-                    process_total += article_count
-                    emit_progress(
-                        "Processing articles", process_completed, process_total
-                    )
+                    articles_processed = 0
 
                     def report_progress(article_id):
-                        nonlocal process_completed
-                        process_completed += 1
+                        nonlocal articles_processed
+                        articles_processed += 1
                         emit_article_progress(article_id)
-                        if (
-                            process_completed == 1
-                            or process_completed % 10 == 0
-                            or process_completed == process_total
-                        ):
-                            emit_progress(
-                                "Processing articles", process_completed, process_total
-                            )
+                        report_source_progress(key, articles_processed, article_count)
 
                     partial_indexes.append(
                         process_json_file(
@@ -866,9 +942,6 @@ def download_and_process_files(
                         )
                     )
                     processed_filenames.add(filename)
-                    emit_progress(
-                        "Processing articles", process_completed, process_total
-                    )
 
                 next_series = 0
                 for future in as_completed(futures):
@@ -889,7 +962,11 @@ def download_and_process_files(
                         next_series < len(ordered_series)
                         and ordered_series[next_series] in completed_results
                     ):
-                        process_ready_series(ordered_series[next_series])
+                        filename = ordered_series[next_series]
+                        process_ready_series(filename)
+                        report_source_progress(
+                            file_to_key[filename], 1, 1
+                        )
                         next_series += 1
 
     notify_downloads_complete()
@@ -954,24 +1031,6 @@ def download_and_process_files(
             series_sort_key(group) if group != "other" else (2, float("inf"), group)
         ),
     )
-    process_total += sum(
-        len(next((record[3] for record in records if record[2] is None), []))
-        + sum(1 for record in records if record[2] is not None)
-        for records in regular_batches.values()
-    ) + len(variant_articles)
-    emit_progress("Processing articles", process_completed, process_total)
-
-    def report_article_progress(article_id):
-        nonlocal process_completed
-        process_completed += 1
-        emit_article_progress(article_id)
-        if (
-            process_completed == 1
-            or process_completed % 10 == 0
-            or process_completed == process_total
-        ):
-            emit_progress("Processing articles", process_completed, process_total)
-
     for group in ordered_groups:
         records = regular_batches[group]
         main_record = next(
@@ -987,6 +1046,18 @@ def download_and_process_files(
             path, key, _, _ = records[0]
             article_ids = []
             additional_articles = records
+
+        group_article_count = len(article_ids) + len(additional_articles)
+        group_articles_processed = 0
+
+        def report_article_progress(article_id):
+            nonlocal group_articles_processed
+            group_articles_processed += 1
+            emit_article_progress(article_id)
+            report_source_progress(
+                group, group_articles_processed, group_article_count
+            )
+
         partial_indexes.append(
             process_json_file(
                 path,
@@ -1010,6 +1081,10 @@ def download_and_process_files(
             )
         )
         path, key, _, _ = variant_articles[0]
+
+        def report_variant_progress(article_id):
+            emit_article_progress(article_id)
+
         partial_indexes.append(
             process_json_file(
                 path,
@@ -1017,18 +1092,23 @@ def download_and_process_files(
                 articles_by_link,
                 links_by_id,
                 titles_by_reference,
-                article_progress=report_article_progress,
+                article_progress=report_variant_progress,
                 download_media=download_media,
                 article_ids=[],
                 additional_articles=variant_articles,
             )
         )
 
+    if process_completed < 100:
+        process_completed = 100
+        emit_progress("Processing articles", process_completed, 100)
+
     return downloaded_files, changed_files, partial_indexes, processed_filenames
 
 
 def update_archive(download_media=False):
     ensure_folder(BASE_FOLDER)
+    ensure_folder(API_FOLDER)
     ensure_folder(JSON_FOLDER)
     ensure_folder(HTML_FOLDER)
     ensure_folder(IMG_FOLDER)
@@ -1044,7 +1124,6 @@ def update_archive(download_media=False):
         return 1
 
     file_to_key = {v: k for k, v in content_index.items()}
-
     emit_output("Loading official SCP titles...")
     titles_by_reference = fetch_series_titles()
 
@@ -1059,7 +1138,11 @@ def update_archive(download_media=False):
     previous_entries_by_source = index_entries_by_source(previous_index)
     force_process_by_file = {
         filename: source_needs_processing(
-            previous_index, filename, previous_entries_by_source
+            previous_index,
+            os.path.relpath(os.path.join(API_FOLDER, filename), BASE_FOLDER).replace(
+                os.sep, "/"
+            ),
+            previous_entries_by_source,
         )
         for filename in content_index.values()
     }
@@ -1070,7 +1153,10 @@ def update_archive(download_media=False):
         result = update_scp_001_json(
             force_process=source_needs_processing(
                 previous_index,
-                "content_scp-001.json",
+                os.path.relpath(
+                    os.path.join(JSON_FOLDER, "content_scp-001.json"),
+                    BASE_FOLDER,
+                ).replace(os.sep, "/"),
                 previous_entries_by_source,
             )
         )
@@ -1102,9 +1188,9 @@ def update_archive(download_media=False):
         downloaded_files.append(scp_001_file)
     if scp_001_changed and "content_scp-001.json" not in processed_filenames:
         current_files = [
-            (os.path.join(JSON_FOLDER, source_filename), source_key)
+            (os.path.join(API_FOLDER, source_filename), source_key)
             for source_filename, source_key in file_to_key.items()
-            if os.path.exists(os.path.join(JSON_FOLDER, source_filename))
+            if os.path.exists(os.path.join(API_FOLDER, source_filename))
         ]
         current_files.append(scp_001_file)
         articles_by_link, links_by_id = build_article_index(current_files)
@@ -1128,18 +1214,24 @@ def update_archive(download_media=False):
     articles_by_link, links_by_id = build_article_index(json_files)
     emit_output(f"Found {len(articles_by_link)} API links.")
 
-    changed_filenames = {os.path.basename(path) for path, _ in changed_files}
-    unchanged_filenames = {
-        os.path.basename(path)
+    changed_sources = {
+        os.path.relpath(path, BASE_FOLDER).replace(os.sep, "/")
+        for path, _ in changed_files
+    }
+    unchanged_sources = {
+        os.path.relpath(path, BASE_FOLDER).replace(os.sep, "/")
         for path, _ in json_files
-        if os.path.basename(path) not in changed_filenames
+        if os.path.relpath(path, BASE_FOLDER).replace(os.sep, "/")
+        not in changed_sources
     }
-    index = {
-        identity: metadata
-        for identity, metadata in (previous_index or {}).items()
-        if isinstance(metadata, dict)
-        and metadata.get("json_file") in unchanged_filenames
-    }
+    index = {}
+    for identity, metadata in (previous_index or {}).items():
+        if not isinstance(metadata, dict):
+            continue
+        json_file = metadata.get("json_file")
+        if not isinstance(json_file, str) or json_file not in unchanged_sources:
+            continue
+        index[identity] = metadata
     for partial in partial_indexes:
         index.update(partial)
 

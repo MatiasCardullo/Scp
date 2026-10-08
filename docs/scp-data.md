@@ -8,9 +8,11 @@ optionally downloaded images.
 data/
 ├── index.json
 ├── update.log
-├── json/
+├── api/
 │   ├── content_series-1.json
 │   ├── content_joke.json
+│   └── .http_cache.json
+├── json/
 │   └── content_scp-001.json
 ├── html/
 │   ├── series-1/
@@ -21,17 +23,21 @@ data/
     └── ...
 ```
 
-## `json/`: article sources
+## `api/`: downloaded API sources
 
 The API JSON files are stored here, separated by series or group. Filenames
 follow the manifest, for example `content_series-1.json` or
 `content_international.json`. Their keys are article identifiers, and their
 values preserve the source fields, including HTML and original markup when
-available.
+available. `.http_cache.json` stores remote
+`ETag` and `Last-Modified` validators so unchanged downloads can be skipped
+with conditional HTTP requests.
 
-`content_scp-001.json` is the exception: the loader builds it from the
-SCP-001 index page and its linked proposals instead of downloading it from
-the API manifest.
+## `json/`: locally generated sources
+
+This folder contains JSON generated locally by the loader. Currently that is
+`content_scp-001.json`, assembled from the official SCP-001 index and its
+linked proposals instead of being downloaded from the API.
 
 ## `html/`: reader-ready copy
 
@@ -61,7 +67,7 @@ reader needs to locate and display the article:
 | `scp_id` | Identifier accepted by the reader, such as `SCP-173`. |
 | `title` | Display title. |
 | `folder` | Subfolder of `html/` containing the article. |
-| `json_file` | Source file in `json/`, used as a fallback if the HTML is missing. |
+| `json_file` | Source JSON path relative to `data/` (for example `api/content_series-1.json`), used as a fallback if the HTML is missing. |
 | `html_file` | Generated HTML filename. |
 | `json_key` | May appear when the JSON record's internal key differs from `scp_id`. |
 
